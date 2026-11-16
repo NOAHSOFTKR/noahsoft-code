@@ -1,3 +1,4 @@
+import { delegationInput, SUBAGENT_TOOLS } from './subagents.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import chalk from 'chalk';
@@ -5,7 +6,7 @@ import type { CanUseTool, HookCallback, PermissionResult } from '@anthropic-ai/c
 
 /** 이 CLI가 모델에 노출하는 SDK 내장 도구 */
 export function enabledTools(platform = process.platform): string[] {
-  const tools = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash'];
+  const tools = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'Agent'];
   // Windows에서는 SDK의 PowerShell 도구도 함께 제공(Bash 도구는 Git Bash 필요)
   if (platform === 'win32') tools.push('PowerShell');
   return tools;
@@ -83,7 +84,7 @@ export function isDangerousCommand(cmd: string): boolean {
   return DANGEROUS_PATTERNS.some((re) => re.test(cmd));
 }
 
-export type Asker = (question: string) => Promise<string>;
+export type Asker = (question: string, signal?: AbortSignal) => Promise<string>;
 
 /**
  * 권한 모드
@@ -172,6 +173,14 @@ export function pathGuardHook(guard: PathGuard, state?: PermissionState): HookCa
   return async (input) => {
     if (input.hook_event_name !== 'PreToolUse') return { continue: true };
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
+    if (input.agent_id && !SUBAGENT_TOOLS.includes(input.tool_name)) {
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'CVP CLI: 서브에이전트에는 허용된 파일·명령 도구만 제공됩니다.' } };
+    }
+    if (input.tool_name === 'Agent' || input.tool_name === 'Task') {
+      const updatedInput = delegationInput(toolInput);
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: updatedInput ? 'allow' : 'deny',
+        permissionDecisionReason: 'CVP CLI: explorer/reviewer의 로컬 동기 실행만 허용됩니다.', ...(updatedInput ? { updatedInput } : {}) } };
+    }
     const target = guard.targetOf(input.tool_name, toolInput);
     if (target && !guard.allows(target, input.cwd)) {
       return {
@@ -201,9 +210,34 @@ export function pathGuardHook(guard: PathGuard, state?: PermissionState): HookCa
   };
 }
 
+const MODE_RANK: Record<CvpPermissionMode, number> = { plan: 0, default: 1, acceptEdits: 2, bypass: 3 };
+
+export function childPermissionState(parent: PermissionState, requested?: CvpPermissionMode): PermissionState {
+  if (requested && MODE_RANK[requested] > MODE_RANK[parent.mode]) {
+    throw new Error(`부모 권한(${parent.mode})보다 높은 자식 권한(${requested})은 부여할 수 없습니다.`);
+  }
+  return {
+    get mode() { return requested && MODE_RANK[requested] < MODE_RANK[parent.mode] ? requested : parent.mode; },
+    set mode(_mode: CvpPermissionMode) { /* child cannot raise its assigned ceiling */ },
+    allowedCommands: new Set<string>(),
+  };
+}
+
+/** Parent and child permission prompts share one queue. */
+export class PermissionQueue {
+  private pending: Promise<void> = Promise.resolve();
+  run(action: () => Promise<PermissionResult>): Promise<PermissionResult> {
+    const result = this.pending.then(action);
+    this.pending = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
+
 export interface CanUseToolDeps {
   guard: PathGuard;
   state: PermissionState;
+  queue?: PermissionQueue;
+  allowModeChange?: boolean;
   /** 사용자에게 묻는 함수. 없으면(비대화형) 위험 작업은 거부 */
   ask?: Asker;
   /** 프롬프트 표시 전/후 UI 정리(스피너 정지 등) */
@@ -216,7 +250,13 @@ export interface CanUseToolDeps {
 /** SDK canUseTool 콜백: 파일 수정·명령 실행 전 사용자 승인 */
 export function makeCanUseTool(deps: CanUseToolDeps): CanUseTool {
   const write = deps.write ?? ((s: string) => process.stdout.write(s));
-  return async (toolName, input, opts): Promise<PermissionResult> => {
+  const queue = deps.queue ?? new PermissionQueue();
+  return (toolName, input, opts): Promise<PermissionResult> => queue.run(async () => {
+    if (opts.signal.aborted) return { behavior: 'deny', message: '중단됨', interrupt: true };
+    if (toolName === 'Agent' || toolName === 'Task') {
+      const updatedInput = delegationInput(input);
+      return updatedInput ? { behavior: 'allow', updatedInput } : { behavior: 'deny', message: 'explorer/reviewer의 로컬 동기 실행만 허용됩니다.' };
+    }
     const target = deps.guard.targetOf(toolName, input);
     if (target && !deps.guard.allows(target)) {
       return { behavior: 'deny', message: `작업 디렉터리 밖 경로(${target})는 허용되지 않습니다.` };
@@ -258,10 +298,13 @@ export function makeCanUseTool(deps: CanUseToolDeps): CanUseTool {
         (opts.decisionReason ? chalk.dim(`  사유: ${opts.decisionReason}\n`) : '') +
         (isShell ? chalk.dim('  ※ 셸 명령은 작업 디렉터리 격리가 적용되지 않습니다(샌드박스 비활성 시).\n') : ''),
     );
-    const always = dangerous ? '' : isShell ? ' / a=이 명령 세션 동안 허용' : isWrite ? ' / a=편집 자동승인 모드로 전환' : '';
+    const always = dangerous ? '' : isShell ? ' / a=이 명령 세션 동안 허용' : isWrite && deps.allowModeChange !== false ? ' / a=편집 자동승인 모드로 전환' : '';
     for (;;) {
       if (opts.signal.aborted) return { behavior: 'deny', message: '중단됨', interrupt: true };
-      const ans = (await deps.ask(chalk.bold(`  허용할까요? [y=허용 / n=거부${always}] `))).trim().toLowerCase();
+      const ans = (await deps.ask(chalk.bold(`  허용할까요? [y=허용 / n=거부${always}] `), opts.signal)).trim().toLowerCase();
+      if (opts.signal.aborted) return { behavior: 'deny', message: '중단됨', interrupt: true };
+      if (target && !deps.guard.allows(target)) return { behavior: 'deny', message: '승인 대기 중 경로가 변경되어 거부했습니다.' };
+      if ((isShell || isWrite) && deps.state.mode === 'plan') return { behavior: 'deny', message: PLAN_DENY };
       if (ans === 'y' || ans === 'yes') return { behavior: 'allow', updatedInput: input };
       if (ans === 'a' && always) {
         if (isShell) deps.state.allowedCommands.add(command);
@@ -275,5 +318,5 @@ export function makeCanUseTool(deps: CanUseToolDeps): CanUseTool {
         return { behavior: 'deny', message: '사용자가 이 작업을 거부했습니다. 다른 방법을 제안하거나 사용자에게 확인하세요.' };
       }
     }
-  };
+  });
 }

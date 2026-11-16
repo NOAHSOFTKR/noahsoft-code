@@ -1,3 +1,4 @@
+import type { EffortLevel } from '@anthropic-ai/claude-agent-sdk';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,6 +23,8 @@ export function agentConfigDir(): string {
 
 export interface FileConfig {
   model?: string;
+  subagentTools?: boolean;
+  effort?: EffortLevel;
   maxSessionCostUsd?: number;
   /** SDK 샌드박스(Linux bubblewrap / macOS seatbelt) 사용 여부. Windows에서는 지원되지 않는다. */
   sandbox?: boolean;
@@ -34,8 +37,10 @@ export interface FileConfig {
   permissionMode?: string;
 }
 
-const CONFIG_KEYS: Record<string, 'string' | 'number' | 'boolean' | 'list' | 'mode'> = {
+const CONFIG_KEYS: Record<string, 'string' | 'number' | 'boolean' | 'list' | 'mode' | 'effort'> = {
   model: 'string',
+  subagentTools: 'boolean',
+  effort: 'effort',
   maxSessionCostUsd: 'number',
   sandbox: 'boolean',
   additionalDirectories: 'list',
@@ -83,6 +88,9 @@ export function setConfigValue(rawKey: string, rawValue: string): { key: string;
       if (!['true', 'false'].includes(rawValue)) throw new Error(`${key}에는 true 또는 false가 필요합니다.`);
       value = rawValue === 'true';
       break;
+    case 'effort':
+      value = parseEffort(rawValue);
+      break;
     case 'mode':
       value = parsePermissionMode(rawValue);
       break;
@@ -121,6 +129,8 @@ export function loadDotEnv(cwd: string): string | undefined {
 
 export interface ResolvedConfig {
   model?: string;
+  subagentTools?: boolean;
+  effort?: EffortLevel;
   modelSource: 'flag' | 'env' | 'config' | 'none';
   maxSessionCostUsd: number;
   budgetSource: 'flag' | 'env' | 'config' | 'default';
@@ -133,9 +143,16 @@ export interface ResolvedConfig {
   cwd: string;
 }
 
+export function parseEffort(value: unknown): EffortLevel {
+  if (typeof value !== 'string' || !['low', 'medium', 'high', 'xhigh', 'max'].includes(value)) {
+    throw new Error('effort에는 low, medium, high, xhigh, max 중 하나가 필요합니다.');
+  }
+  return value as EffortLevel;
+}
+
 export const DEFAULT_BUDGET_USD = 1.0;
 
-export function resolveConfig(flags: { model?: string; budget?: number; cwd?: string; permissionMode?: string }): ResolvedConfig {
+export function resolveConfig(flags: { subagentTools?: boolean; model?: string; effort?: string; budget?: number; cwd?: string; permissionMode?: string }): ResolvedConfig {
   const file = loadFileConfig();
   const env = process.env;
   let model: string | undefined;
@@ -163,6 +180,10 @@ export function resolveConfig(flags: { model?: string; budget?: number; cwd?: st
   return {
     model,
     modelSource,
+    subagentTools: flags.subagentTools ?? file.subagentTools ?? false,
+    effort: flags.effort !== undefined ? parseEffort(flags.effort)
+      : env.CVP_EFFORT !== undefined ? parseEffort(env.CVP_EFFORT)
+      : file.effort !== undefined ? parseEffort(file.effort) : undefined,
     permissionMode,
     permissionModeSource,
     maxSessionCostUsd: budget,

@@ -29,6 +29,7 @@ export interface SessionLedger {
   byModel: Record<string, ModelTotals>;
   requests: RequestUsage[];
   updatedAt: string;
+  delegated?: { costUsd: number; byModel: Record<string, ModelTotals> };
 }
 
 /** SDK 결과 메시지의 modelUsage 와 같은 모양(필요 필드만) */
@@ -125,7 +126,13 @@ export class CostTracker {
       updatedAt: new Date().toISOString(),
     };
     this.costAtQueryStart = this.ledger.costUsd;
+    this.applyDelegated(-1);
     this.baseByModel = structuredClone(this.ledger.byModel);
+    this.applyDelegated(1);
+  }
+
+  createChildTracker(sessionId: string | undefined): CostTracker {
+    return new CostTracker(sessionId, Number.MAX_VALUE, this.pricing);
   }
 
   get sessionCost(): number {
@@ -183,6 +190,7 @@ export class CostTracker {
   /** 턴 결과(result 메시지)를 반영. 반환값은 이번 턴의 비용 증분 */
   onResult(sessionId: string, totalCostUsd: number, modelUsage: Record<string, SdkModelUsage>): number {
     this.bindSession(sessionId);
+    this.applyDelegated(-1);
     const prior = this.ledger.costUsd;
     if (this.lastProcessTotal === undefined) {
       // 이 프로세스의 첫 결과. SDK가 이전 합계를 이어받았는지 판단한다:
@@ -221,8 +229,33 @@ export class CostTracker {
     this.ledger.turns += 1;
     this.ledger.updatedAt = new Date().toISOString();
     this.lastTurnCost = this.ledger.costUsd - prior;
+    this.applyDelegated(1);
     if (this.ledger.sessionId) saveLedger(this.ledger);
     return this.lastTurnCost;
+  }
+
+  private applyDelegated(sign: number): void {
+    const delegated = this.ledger.delegated;
+    if (!delegated) return;
+    this.ledger.costUsd += sign * delegated.costUsd;
+    for (const [model, totals] of Object.entries(delegated.byModel)) {
+      const target = this.ledger.byModel[model] ??= { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
+      for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'costUsd'] as const) target[key] += sign * totals[key];
+    }
+  }
+
+  /** Add a child turn delta without changing the parent SDK cumulative baseline. */
+  addDelegated(costUsd: number, byModel: Record<string, ModelTotals>): void {
+    this.applyDelegated(-1);
+    const delegated = this.ledger.delegated ??= { costUsd: 0, byModel: {} };
+    delegated.costUsd += costUsd;
+    for (const [model, totals] of Object.entries(byModel)) {
+      const target = delegated.byModel[model] ??= { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
+      for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'costUsd'] as const) target[key] += totals[key];
+      target.costBasis = totals.costBasis;
+    }
+    this.applyDelegated(1);
+    if (this.ledger.sessionId) saveLedger(this.ledger);
   }
 
   private mergeByModel(current: Record<string, ModelTotals>): void {

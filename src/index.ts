@@ -32,11 +32,13 @@ ${chalk.bold('사용법')}
   cvp models [--verify]            조회 가능한 모델 목록 (--verify: 실제 호출로 권한 검증)
   cvp verify [model-id]            API 키·조직·모델 접근 검증
   cvp sessions                     저장된 세션 목록
-  cvp config set <key> <value>     설정 저장 (model, maxSessionCostUsd, permissionMode, sandbox, additionalDirectories, expectedOrgId)
+  cvp config set <key> <value>     설정 저장 (effort, model, maxSessionCostUsd, permissionMode, sandbox, additionalDirectories, expectedOrgId)
   cvp config get [key] | unset <key> | path
 
 ${chalk.bold('옵션')}
   -m, --model <id>       사용할 모델 (CVP_MODEL / config 보다 우선)
+      --subagent-tools  spawn_agent/send_message/wait_agent 제공 (예산: 부모 50%, 자식 50%)
+      --effort <level>  추론 노력: low | medium | high | xhigh | max (CVP_EFFORT / config 보다 우선)
   -r, --resume <id>      세션 재개
   -c, --continue         이 디렉터리의 가장 최근 세션 이어가기
   -b, --budget <usd>     세션 예상 비용 한도 (CVP_MAX_SESSION_COST_USD 보다 우선)
@@ -47,8 +49,10 @@ ${chalk.bold('옵션')}
   -y, --yes              (models --verify) 확인 질문 생략
   -v, --version / -h, --help
 
+서브에이전트: explorer(코드 탐색), reviewer(코드 검토) — 프롬프트에서 이름으로 요청
+
 ${chalk.bold('환경변수')}
-  ANTHROPIC_API_KEY  CVP_MODEL  CVP_MAX_SESSION_COST_USD  CVP_PERMISSION_MODE  CVP_EXPECTED_ORG_ID  CVP_HOME  CVP_DEBUG
+  ANTHROPIC_API_KEY  CVP_MODEL  CVP_EFFORT  CVP_MAX_SESSION_COST_USD  CVP_PERMISSION_MODE  CVP_EXPECTED_ORG_ID  CVP_HOME  CVP_DEBUG
 `;
 
 function fail(msg: string, code = 1): never {
@@ -214,15 +218,20 @@ async function cmdPrint(prompt: string, cfg: ResolvedConfig, opts: { resume?: st
   const apiKey = requireKey();
   const model = requireModel(cfg);
   const tracker = new CostTracker(opts.resume, cfg.maxSessionCostUsd, cfg.pricing);
-  let ask: ((q: string) => Promise<string>) | undefined;
+  let ask: ((q: string, signal?: AbortSignal) => Promise<string>) | undefined;
   let rl: import('node:readline/promises').Interface | undefined;
   if (process.stdin.isTTY) {
     rl = (await import('node:readline/promises')).createInterface({ input: process.stdin, output: process.stdout });
-    ask = (q) => rl!.question(q);
+    ask = async (q, signal) => {
+      try { return await rl!.question(q, { signal }); }
+      catch (err) { if (signal?.aborted) return 'n'; throw err; }
+    };
   }
   const session = new AgentSession({
     apiKey,
     model,
+    effort: cfg.effort,
+    subagentTools: cfg.subagentTools,
     cwd: cfg.cwd,
     resume: opts.resume,
     continueLast: opts.continueLast,
@@ -283,6 +292,8 @@ async function main(): Promise<void> {
     options: {
       print: { type: 'string', short: 'p' },
       model: { type: 'string', short: 'm' },
+      effort: { type: 'string' },
+      'subagent-tools': { type: 'boolean' },
       resume: { type: 'string', short: 'r' },
       continue: { type: 'boolean', short: 'c' },
       budget: { type: 'string', short: 'b' },
@@ -315,7 +326,7 @@ async function main(): Promise<void> {
   }
   let cfg: ResolvedConfig;
   try {
-    cfg = resolveConfig({ model: values.model, budget, permissionMode: values['permission-mode'] });
+    cfg = resolveConfig({ subagentTools: values['subagent-tools'], model: values.model, effort: values.effort, budget, permissionMode: values['permission-mode'] });
   } catch (err) {
     fail((err as Error).message);
   }

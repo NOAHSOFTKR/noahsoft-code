@@ -22,6 +22,7 @@ cvp
 | 변수 | 설명 |
 |---|---|
 | `ANTHROPIC_API_KEY` | **필수.** Console(platform.claude.com)에서 발급한 CVP 조직의 API 키 (`sk-ant-api…`) |
+| `CVP_EFFORT` | 추론 노력: `low`, `medium`, `high`, `xhigh`, `max`. 미지정 시 SDK 기본 동작 유지 |
 | `CVP_MODEL` | 사용할 모델 ID. **기본값 없음**(하드코딩 금지) |
 | `CVP_MAX_SESSION_COST_USD` | 세션당 예상 비용 한도. 기본 `1.00` |
 | `CVP_EXPECTED_ORG_ID` | (선택) CVP 조직 ID. `cvp verify`가 API 응답 헤더의 조직 ID와 대조 |
@@ -47,6 +48,8 @@ cvp
 ```bash
 cvp                                  # 대화형 모드
 cvp -p "현재 디렉터리의 코드를 분석해줘"   # 단일 프롬프트 실행 후 종료 (--json 가능)
+cvp --effort high                    # 이번 실행의 추론 노력 지정
+cvp config set effort high           # 기본 추론 노력 저장 (해제: cvp config unset effort)
 cvp --model <model-id>               # 이번 실행의 모델 지정
 cvp --resume <session-id>            # 세션 재개   (-c: 가장 최근 세션 이어가기)
 cvp models                           # 조회 가능한 모델 목록 (GET /v1/models)
@@ -74,7 +77,7 @@ cvp config set budget 2.5            # 세션 예산 저장
 | `/resume [번호\|ID]` | 이전 세션 재개 |
 | `/exit` | 종료 |
 
-입력 줄 끝에 `\`를 붙이면 여러 줄 입력. 실행 중 **Ctrl+C**는 현재 턴만 중단하고, 대기 중 Ctrl+C 두 번(또는 Ctrl+D)은 종료합니다.
+대화형 터미널에서는 **Enter가 줄바꿈**, **Ctrl+Enter가 메시지 전송**입니다. 여러 줄을 붙여넣어도 하나의 입력으로 모으며 전송 키를 누르기 전에는 요청하지 않습니다. 터미널이 Ctrl+Enter를 일반 Enter와 구분하지 않으면 Ctrl+J를 사용하거나 터미널의 키 설정을 확인하세요. 승인·확인 질문은 기존처럼 Enter로 답합니다. 파이프 입력에서는 줄 끝의 `\`로 여러 줄을 연결하는 기존 동작을 유지합니다. 실행 중 **Ctrl+C**는 현재 턴만 중단하고, 대기 중 Ctrl+C 두 번(또는 Ctrl+D)은 종료합니다.
 
 응답은 실시간으로 스트리밍되며, Markdown은 완결된 블록 단위로 렌더링하고 코드 블록은 구문 강조합니다(`--raw`이면 원문 그대로).
 
@@ -112,7 +115,7 @@ cvp config set budget 2.5            # 세션 예산 저장
 
 ## 도구와 권한
 
-모델에는 SDK 내장 도구 `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`(Windows에서는 `PowerShell` 추가)만 제공합니다(`tools` 옵션).
+모델에는 SDK 내장 도구 `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`, `Agent`(Windows에서는 `PowerShell` 추가)만 제공합니다(`tools` 옵션).
 
 ### 권한 모드
 
@@ -150,3 +153,49 @@ npm test          # 빌드 + 단위 테스트 + Mock API 통합 테스트
 ```
 
 통합 테스트는 `test/mock-server.mjs`(테스트 전용 로컬 Mock Messages API)를 `ANTHROPIC_BASE_URL`로 지정해 실제 `cvp` 바이너리 → Claude Agent SDK → Mock API 전체 경로를 검증합니다. 실제 API 검증은 `cvp verify`로 수행합니다.
+
+## 서브에이전트
+
+`explorer`(코드 탐색)와 `reviewer`(코드 검토)를 Agent 도구로 호출할 수 있습니다.
+예: `cvp -p "explorer 서브에이전트로 프로젝트 구조를 조사하고 결과를 기다려줘"`
+또는 대화 중 "reviewer 서브에이전트로 변경 사항을 검토해줘"라고 요청하세요.
+
+두 에이전트는 부모의 현재 모델과 설정한 effort를 사용합니다. Read/Glob/Grep/Edit/Write/Bash와
+Windows의 PowerShell을 제공하며, 부모와 같은 경로 제한·권한 승인 정책을 적용합니다.
+에이전트별 최대 12턴이며, 백그라운드·원격 실행·재위임은 지원하지 않습니다.
+서브에이전트의 API 호출도 비용이 발생하고 SDK의 전체 비용/예산에 포함됩니다.
+
+### 개별 에이전트 툴
+
+`cvp --subagent-tools`로 실행하면 기존 Agent 대신 다음 MCP 툴을 모델에 직접 제공합니다.
+영구 활성화: `cvp config set subagentTools true` (해제: `cvp config set subagentTools false`).
+
+- `mcp__cvp_agents__spawn_agent`: `{ "role": "explorer", "message": "구조를 조사해줘" }` → 에이전트 ID 즉시 반환
+- `mcp__cvp_agents__wait_agent`: `{ "agent_id": "<ID>", "timeout_ms": 10000 }` → 상태·결과 조회, 최대 60초 대기
+- `mcp__cvp_agents__send_message`: `{ "agent_id": "<ID>", "message": "추가로 오류 처리를 확인해줘" }` → 완료된 에이전트의 대화를 재개
+
+예: `cvp --subagent-tools -p "spawn_agent로 explorer와 reviewer를 생성하고 wait_agent로 결과를 모아줘"`
+실행 중인 에이전트에는 메시지를 보낼 수 없습니다. 먼저 완료를 기다리세요.
+에이전트 ID는 현재 부모 세션 안에서만 유효하며, 최대 3개 동시 실행·16개 보관,
+각 실행은 12턴·120초로 제한합니다. 부모 턴 완료·Ctrl+C·종료 시 남은 작업을 중단합니다.
+자식은 현재 부모 모델과 effort, 파일·명령 도구와 경로 제한 및 sandbox 설정을 사용합니다.
+
+`spawn_agent`의 선택 필드 `permission_mode`로 AI가 자식 권한을 지정할 수 있습니다.
+값은 `plan`, `default`, `acceptEdits`, `bypass`이며, 미지정 시 부모의 현재 권한을 동적으로 상속합니다.
+권한 순서는 `plan < default < acceptEdits < bypass`입니다. 부모보다 높은 권한 요청은 생성 전에 실패합니다.
+예: 부모가 `plan`일 때 `permission_mode: "acceptEdits"`는 거부됩니다.
+부모가 `bypass`이면 `{ "role": "explorer", "message": "코드를 수정해줘", "permission_mode": "acceptEdits" }`처럼 낮춰 생성할 수 있습니다.
+실행 중 부모 권한을 낮추면 자식도 그 상한을 따르며, `send_message`로 권한을 바꿀 수는 없습니다.
+
+`default`는 수정·명령 승인 요청, `acceptEdits`는 수정 자동 승인·명령 승인 요청,
+`plan`은 수정·명령 거부, `bypass`는 일반 수정·명령 자동 승인입니다.
+위험 명령은 계속 승인이 필요하고, 비대화형에서 승인할 수 없는 요청은 거부됩니다.
+부모와 모든 자식의 승인 질문은 하나씩 표시하며, 자식 승인에서 권한 모드를 올릴 수 없습니다.
+같은 작업 디렉터리를 공유하므로 부모는 자식별 수정 파일을 나누고 같은 파일의 동시 수정을 피해야 합니다.
+셸 명령 내부 경로는 기존과 같이 애플리케이션 경로 검사로 격리되지 않습니다.
+
+이 모드에서는 시작 시 잔여 예산을 부모 50%·자식 전체 50%로 분리합니다.
+자식을 쓰지 않아도 부모는 자기 몫까지만 사용하며, 자식의 각 실행은 자식 전체 예산의 최대 1/3을 예약합니다.
+자식 비용·토큰은 부모 원장에 별도로 보관해 전체 합계에 포함합니다.
+중단·실패로 최종 사용량을 얻지 못하면 예약 예산 전체를 보수적으로 사용한 것으로 기록합니다.
+이는 실제 청구액이 아닌 추정치이며, 기존 비용 제한의 한계는 동일합니다.

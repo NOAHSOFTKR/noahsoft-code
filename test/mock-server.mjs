@@ -101,14 +101,45 @@ export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels 
           return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model, content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 12, output_tokens: 1 } }));
         }
         if (!isMain) return sse(res, [start, ...text('Mock title'), ...end('end_turn')]);
+        if (toolNames.includes('mcp__cvp_agents__spawn_agent') && JSON.stringify(json.messages).includes('COORDINATE_AGENTS')) {
+          const previous = json.messages.flatMap((m) => Array.isArray(m.content) ? m.content : []).filter((c) => c.type === 'tool_use');
+          const idMatch = lastText.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+          let name = 'mcp__cvp_agents__spawn_agent';
+          let args = {role:'explorer',message:'BANANA child research'};
+          if (previous.length && idMatch) {
+            const lastTool = previous.at(-1).name;
+            if (lastTool.endsWith('spawn_agent') || lastTool.endsWith('send_message') || lastText.includes('running')) {
+              name = 'mcp__cvp_agents__wait_agent'; args = {agent_id:idMatch[0],timeout_ms:10000};
+            } else if (!previous.some((x) => x.name.endsWith('send_message'))) {
+              name = 'mcp__cvp_agents__send_message'; args = {agent_id:idMatch[0],message:'RECALL child conversation'};
+            } else return sse(res, [start, ...text('COORDINATION_DONE'), ...end('end_turn')]);
+          }
+          return sse(res,[start,...tool(name,args),...end('tool_use')]);
+        }
         if (hasToolResult) {
           return sse(res, [start, ...text(`도구 결과 수신: ${lastText.slice(0, 200)}\n`), ...end('end_turn')]);
+        }
+        if (lastText.includes('RUN_SUBAGENT')) {
+          return sse(res, [start, ...tool('Agent', { description: 'Explore sample project', prompt: 'SUBAGENT_READ_OUTSIDE', subagent_type: 'explorer', run_in_background: false }), ...end('tool_use')]);
+        }
+        if (lastText.includes('SUBAGENT_READ_OUTSIDE')) {
+          const outside = process.platform === 'win32' ? 'C:\\Windows\\win.ini' : '/etc/hostname';
+          return sse(res, [start, ...tool('Read', { file_path: outside }), ...end('tool_use')]);
         }
         if (lastText.includes('RUN_BASH')) {
           return sse(res, [start, ...tool('Bash', { command: 'echo hello-cvp', description: 'echo test' }), ...end('tool_use')]);
         }
         if (lastText.includes('RUN_POWERSHELL') && toolNames.includes('PowerShell')) {
           return sse(res, [start, ...tool('PowerShell', { command: 'Write-Output hello-ps' }), ...end('tool_use')]);
+        }
+        if (lastText.includes('DANGEROUS_COMMAND')) {
+          return sse(res, [start, ...tool('Bash', { command: 'echo rm -rf example' }), ...end('tool_use')]);
+        }
+        if (lastText.includes('WRITE_OUTSIDE')) {
+          return sse(res, [start, ...tool('Write', { file_path: `${cwd}/../outside-write.txt`, content: 'must not write' }), ...end('tool_use')]);
+        }
+        if (lastText.includes('EDIT_FILE')) {
+          return sse(res, [start, ...tool('Edit', { file_path: `${cwd}/README.md`, old_string: '# sample', new_string: '# edited' }), ...end('tool_use')]);
         }
         if (lastText.includes('WRITE_FILE')) {
           return sse(res, [start, ...tool('Write', { file_path: `${cwd}/cvp-out.txt`, content: 'written by mock\n' }), ...end('tool_use')]);

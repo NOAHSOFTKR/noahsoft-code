@@ -1,9 +1,11 @@
 import { query, type Options, type Query, type SDKMessage, type SDKUserMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import chalk from 'chalk';
+import { AgentTools, AGENT_TOOL_NAMES } from './agent-tools.js';
+import { subagentDefinitions } from './subagents.js';
 import { buildAgentEnv } from './auth.js';
 import { CostTracker, type SdkModelUsage } from './cost.js';
 import { classifyAgentError } from './errors.js';
-import { enabledTools, makeCanUseTool, pathGuardHook, PathGuard, type Asker, type CvpPermissionMode, type PermissionState } from './permissions.js';
+import { enabledTools, makeCanUseTool, pathGuardHook, PathGuard, PermissionQueue, type Asker, type CvpPermissionMode, type PermissionState } from './permissions.js';
 import { MarkdownStream, Spinner, ui } from './render.js';
 
 /** 스트리밍 입력용 비동기 큐 */
@@ -36,6 +38,8 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
 export interface AgentSessionOptions {
   apiKey: string;
   model: string;
+  effort?: Options['effort'];
+  subagentTools?: boolean;
   cwd: string;
   resume?: string;
   continueLast?: boolean;
@@ -64,6 +68,10 @@ function toolSummary(name: string, input: Record<string, unknown>): string {
     case 'Bash':
     case 'PowerShell':
       s = pick('command');
+      break;
+    case 'Agent':
+    case 'Task':
+      s = `${pick('subagent_type')}: ${pick('description')}`;
       break;
     case 'Read':
     case 'Write':
@@ -96,6 +104,9 @@ function resultText(content: unknown): string {
  */
 export class AgentSession {
   private q: Query | undefined;
+  private agentTools?: AgentTools;
+  private permissionQueue = new PermissionQueue();
+  private turnStartCost = 0;
   private input = new InputQueue();
   private pending: { resolve: (o: TurnOutcome) => void } | undefined;
   private loop: Promise<void> | undefined;
@@ -123,19 +134,28 @@ export class AgentSession {
   private buildOptions(): Options {
     const { o } = this;
     const remaining = Math.max(0, o.tracker.limitUsd - o.tracker.sessionCost);
+    if (o.subagentTools) this.agentTools ??= new AgentTools({ apiKey: o.apiKey, cwd: o.cwd, guard: o.guard, model: () => this.activeModel, effort: o.effort, budgetUsd: remaining / 2, tracker: o.tracker,
+      permState: o.permState, queue: this.permissionQueue, ask: o.ask, sandbox: o.sandbox,
+      beforePrompt: () => { this.spinner.stop(); this.md.flush(); }, write: this.out,
+    });
     return {
       model: o.model,
+      effort: o.effort,
       cwd: o.cwd,
-      env: buildAgentEnv(o.apiKey),
+      env: { ...buildAgentEnv(o.apiKey), ...(o.subagentTools ? { ENABLE_TOOL_SEARCH: 'false' } : {}) },
       resume: o.resume,
       continue: o.continueLast && !o.resume ? true : undefined,
-      tools: enabledTools(),
+      tools: o.subagentTools ? enabledTools().filter((name) => name !== 'Agent') : enabledTools(),
+      ...(this.agentTools ? { mcpServers: { cvp_agents: this.agentTools.server() }, allowedTools: AGENT_TOOL_NAMES } : {}),
+      agents: o.subagentTools ? undefined : subagentDefinitions(o.effort),
+      disallowedTools: ['Agent(fork)'],
       // 파일 시스템 설정(~/.claude/settings.json, 프로젝트 .claude/)을 읽지 않음: 권한 규칙·훅·apiKeyHelper 격리
       settingSources: [],
       permissionMode: 'default',
       canUseTool: makeCanUseTool({
         guard: o.guard,
         state: o.permState,
+        queue: this.permissionQueue,
         ask: o.ask,
         beforePrompt: () => {
           this.spinner.stop();
@@ -144,16 +164,17 @@ export class AgentSession {
         write: this.out,
         onModeChange: o.onModeChange,
       }),
-      hooks: { PreToolUse: [{ hooks: [pathGuardHook(o.guard, o.permState)] }] },
+      hooks: { PreToolUse: [{ hooks: [pathGuardHook(o.guard, o.permState)], onFailure: 'block' }] },
       additionalDirectories: o.guard.roots.slice(1),
       includePartialMessages: true,
       // SDK 자체 예산 한도(이번 query() 시작 이후 지출 기준) — CLI 사전 차단과 이중으로 적용
-      maxBudgetUsd: remaining > 0 ? remaining : 0.000001,
+      maxBudgetUsd: remaining > 0 ? remaining / (o.subagentTools ? 2 : 1) : 0.000001,
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
         append:
-          'You are running inside "CVP CLI", a terminal tool. Work only inside the current working directory unless the user explicitly asks otherwise. Answer in the user\'s language.',
+          (o.subagentTools ? 'Use the cvp_agents spawn_agent, send_message, and wait_agent tools for delegation. Spawn returns an ID; wait for completion before using the result or sending follow-up work. Workers may edit and execute commands under their assigned permission_mode, which cannot exceed your current mode. They cannot delegate. Assign non-overlapping files to concurrent workers. ' : '') +
+          'You are running inside "CVP CLI", a terminal tool. Work only inside the current working directory unless the user explicitly asks otherwise. Answer in the user\'s language. Use explorer for code research and reviewer for independent review when useful or requested. Wait for their report before answering. Subagents must obey the assigned permission policy. Avoid concurrent edits to the same files.',
       },
       sandbox: o.sandbox ? { enabled: true, failIfUnavailable: false } : undefined,
       stderr: process.env.CVP_DEBUG ? (d) => process.stderr.write(chalk.dim(d)) : undefined,
@@ -182,6 +203,7 @@ export class AgentSession {
     if (this.dead) throw new Error(`세션이 종료되었습니다: ${this.dead}`);
     this.o.tracker.assertWithinBudget();
     if (!this.q) this.start();
+    this.turnStartCost = this.o.tracker.sessionCost;
     this.busy = true;
     this.lastText = '';
     const done = new Promise<TurnOutcome>((resolve) => (this.pending = { resolve }));
@@ -208,7 +230,7 @@ export class AgentSession {
     this.out(ui.warn('\n⏹ 실행 중단 요청됨…\n'));
     this.interrupted = true;
     try {
-      await this.q.interrupt();
+      await Promise.allSettled([this.q.interrupt(), this.agentTools?.stop()]);
     } catch {
       /* 이미 끝난 경우 무시 */
     }
@@ -222,6 +244,7 @@ export class AgentSession {
 
   async close(): Promise<void> {
     this.input.close();
+    await this.agentTools?.close();
     try {
       this.q?.close();
     } catch {
@@ -232,11 +255,11 @@ export class AgentSession {
 
   private async consume(): Promise<void> {
     if (!this.q) return;
-    for await (const msg of this.q) this.handle(msg);
+    for await (const msg of this.q) await this.handle(msg);
     if (this.pending) this.finishTurn({ turnCostUsd: 0, error: this.dead ?? '세션 프로세스가 종료되었습니다.' });
   }
 
-  private handle(msg: SDKMessage): void {
+  private async handle(msg: SDKMessage): Promise<void> {
     switch (msg.type) {
       case 'system':
         return this.handleSystem(msg as SDKMessage & { type: 'system' });
@@ -363,11 +386,12 @@ export class AgentSession {
   private lastApiError: string | undefined;
   private interrupted = false;
 
-  private handleResult(msg: SDKResultMessage): void {
+  private async handleResult(msg: SDKResultMessage): Promise<void> {
+    await this.agentTools?.stop();
     this.spinner.stop();
     this.md.flush();
     this.printedHeader = false;
-    const turnCost = this.o.tracker.onResult(
+    this.o.tracker.onResult(
       msg.session_id,
       msg.total_cost_usd,
       msg.modelUsage as unknown as Record<string, SdkModelUsage>,
@@ -387,6 +411,6 @@ export class AgentSession {
     }
     this.lastApiError = undefined;
     this.interrupted = false;
-    this.finishTurn({ result: msg, turnCostUsd: turnCost, error });
+    this.finishTurn({ result: msg, turnCostUsd: this.o.tracker.sessionCost - this.turnStartCost, error });
   }
 }

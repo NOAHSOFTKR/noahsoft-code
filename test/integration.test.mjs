@@ -1,3 +1,4 @@
+import { SUBAGENT_TOOLS } from '../dist/subagents.js';
 // Mock API 기반 통합 테스트: 실제 cvp 바이너리 → Claude Agent SDK → (Mock) Messages API
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -325,4 +326,43 @@ test('Ctrl+C 중단: interrupt() 로 진행 중 턴 중단', async () => {
   assert.ok(!out.includes('tick150'));
   assert.ok(o.result, '중단 후에도 결과 메시지 수신');
   assert.equal(o.error, '사용자가 실행을 중단했습니다.');
+});
+
+
+test('서브에이전트: 실제 SDK 위임, 허용 도구와 외부 경로 차단', async () => {
+  const ws = tempWorkspace();
+  const before = mock.log.length;
+  const r = await runCli(['-p', 'RUN_SUBAGENT'], { cwd: ws.work, env: mockEnv(mock.url, ws.home) });
+  assert.equal(r.code, 0, r.stderr);
+  const calls = mock.log.slice(before).filter((x) => x.path === '/v1/messages' && x.body?.tools?.length);
+  assert.ok(calls.some((x) => x.body.tools.some((t) => t.name === 'Agent')));
+  const children = calls.filter((x) => x.body.messages.some((m) => JSON.stringify(m.content).includes('SUBAGENT_READ_OUTSIDE')) && !x.body.tools.some((t) => t.name === 'Agent'));
+  assert.ok(children.length >= 2, 'subagent makes its own API requests and receives tool result');
+  for (const child of children) {
+    assert.equal(child.body.model, 'claude-sonnet-5-5');
+    assert.ok(child.body.tools.every((t) => SUBAGENT_TOOLS.includes(t.name)));
+    assert.equal(child.headers['x-api-key'], TEST_KEY);
+  }
+  assert.ok(children.some((x) => x.body.messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result' && c.is_error && JSON.stringify(c.content).includes('밖')))), 'child path guard denial reaches model');
+});
+
+
+test('개별 에이전트 MCP 툴: spawn/wait/send/resume와 합산 비용', async () => {
+  const ws = tempWorkspace();
+  const before = mock.log.length;
+  const r = await runCli(['--subagent-tools', '-p', 'COORDINATE_AGENTS', '--json'], {cwd:ws.work,env:mockEnv(mock.url,ws.home)});
+  assert.equal(r.code,0,r.stderr + r.stdout);
+  const output = JSON.parse(r.stdout);
+  assert.equal(output.result, 'COORDINATION_DONE');
+  const calls = mock.log.slice(before).filter((x) => x.path === '/v1/messages' && x.body?.tools?.length);
+  const parent = calls.filter((x) => x.body.tools.some((t) => t.name === 'mcp__cvp_agents__spawn_agent'));
+  const child = calls.filter((x) => !x.body.tools.some((t) => t.name.startsWith('mcp__') || t.name === 'Agent'));
+  assert.ok(parent.length >= 5);
+  assert.ok(child.length >= 2);
+  assert.ok(child.some((x) => JSON.stringify(x.body.messages).includes('BANANA') && JSON.stringify(x.body.messages).includes('RECALL')), 'follow-up resumes original conversation');
+  for (const c of child) assert.ok(c.body.tools.every((t) => SUBAGENT_TOOLS.includes(t.name)), JSON.stringify(c.body.tools.map((t)=>t.name)));
+  const ledger = JSON.parse(fs.readFileSync(path.join(ws.home,'usage', output.session_id + '.json'),'utf8'));
+  assert.ok(ledger.delegated.costUsd > 0);
+  assert.equal(output.session_cost_usd, ledger.costUsd);
+  assert.ok(output.session_cost_usd >= ledger.delegated.costUsd);
 });

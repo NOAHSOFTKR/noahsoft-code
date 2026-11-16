@@ -232,3 +232,143 @@ test('설정 우선순위: flag > env > config', () => {
   delete process.env.CVP_MODEL;
   delete process.env.CVP_MAX_SESSION_COST_USD;
 });
+
+
+test('effort: flag > env > config, validation and SDK options', async () => {
+  const old = process.env.CVP_EFFORT;
+  const previous = fs.readFileSync(path.join(tmpHome, 'config.json'), 'utf8');
+  try {
+    delete process.env.CVP_EFFORT;
+    setConfigValue('effort', 'low');
+    assert.equal(resolveConfig({}).effort, 'low');
+    process.env.CVP_EFFORT = 'medium';
+    assert.equal(resolveConfig({}).effort, 'medium');
+    assert.equal(resolveConfig({ effort: 'high' }).effort, 'high');
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      assert.equal(resolveConfig({ effort }).effort, effort);
+    }
+    assert.throws(() => setConfigValue('effort', 'invalid'), /effort/);
+    assert.throws(() => resolveConfig({ effort: '' }), /effort/);
+    process.env.CVP_EFFORT = 'invalid';
+    assert.throws(() => resolveConfig({}), /effort/);
+    delete process.env.CVP_EFFORT;
+    fs.writeFileSync(path.join(tmpHome, 'config.json'), JSON.stringify({ effort: 123 }));
+    assert.throws(() => resolveConfig({}), /effort/);
+    fs.writeFileSync(path.join(tmpHome, 'config.json'), '{}');
+    assert.equal(resolveConfig({}).effort, undefined);
+    const { AgentSession } = await import('../dist/agent.js');
+    const oldSdkEffort = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    try {
+      process.env.CLAUDE_CODE_EFFORT_LEVEL = 'low';
+      assert.equal(buildAgentEnv('test').CLAUDE_CODE_EFFORT_LEVEL, undefined);
+    } finally {
+      if (oldSdkEffort === undefined) delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+      else process.env.CLAUDE_CODE_EFFORT_LEVEL = oldSdkEffort;
+    }
+    const session = new AgentSession({ model: 'test', effort: 'high', apiKey: 'test', cwd: tmpHome,
+      tracker: new CostTracker(undefined, 1), guard: new PathGuard(tmpHome),
+      permState: newPermissionState('default'), sandbox: false, raw: true });
+    assert.equal(session.buildOptions().effort, 'high');
+  } finally {
+    fs.writeFileSync(path.join(tmpHome, 'config.json'), previous);
+    if (old === undefined) delete process.env.CVP_EFFORT;
+    else process.env.CVP_EFFORT = old;
+  }
+});
+
+
+test('서브에이전트 정책: 허용 도구·동기 실행·경로 및 재위임 차단', async () => {
+  const { subagentDefinitions, delegationInput } = await import('../dist/subagents.js');
+  const { pathGuardHook, enabledTools } = await import('../dist/permissions.js');
+  assert.ok(enabledTools().includes('Agent'));
+  for (const agent of Object.values(subagentDefinitions('high'))) {
+    assert.ok(['Read','Glob','Grep','Write','Edit','Bash'].every((tool) => agent.tools.includes(tool)));
+    assert.equal(agent.model, 'inherit');
+    assert.equal(agent.effort, 'high');
+  }
+  const input = { subagent_type: 'explorer', prompt: 'Inspect code', description: 'Inspect', model: 'haiku', mode: 'bypassPermissions' };
+  assert.deepEqual(delegationInput(input), { subagent_type: 'explorer', prompt: 'Inspect code', description: 'Inspect', run_in_background: false });
+  for (const change of [{subagent_type:'fork'}, {subagent_type:'general-purpose'}, {run_in_background:true}, {isolation:'remote'}, {prompt:''}]) {
+    assert.equal(delegationInput({...input, ...change}), undefined);
+  }
+  const hook = pathGuardHook(new PathGuard(tmpHome), newPermissionState('bypass'));
+  const event = { hook_event_name:'PreToolUse', cwd:tmpHome, tool_use_id:'test', session_id:'test', transcript_path:'test' };
+  const run = (tool_name, tool_input, agent_id) => hook({...event, tool_name, tool_input, agent_id}, undefined, {});
+  assert.equal((await run('Agent', input)).hookSpecificOutput.updatedInput.run_in_background, false);
+  assert.equal((await run('Write', {file_path:path.join(tmpHome,'x')}, 'child')).hookSpecificOutput.permissionDecision, 'ask');
+  assert.equal((await run('Agent', input, 'child')).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal((await run('Read', {file_path:path.join(tmpHome,'..','outside')}, 'child')).hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal((await run('Read', {file_path:path.join(tmpHome,'x')}, 'child')).continue, true);
+});
+
+
+test('자식 비용은 부모 SDK 누적값과 재개 기준을 덮어쓰지 않음', () => {
+  const usage = (n,cost) => ({inputTokens:n,outputTokens:0,cacheReadInputTokens:0,cacheCreationInputTokens:0,costUSD:cost});
+  const child = {inputTokens:10,outputTokens:0,cacheReadTokens:0,cacheWriteTokens:0,costUsd:0.2};
+  const id = 'delegation-cost-test';
+  const t = new CostTracker(undefined,10);
+  t.onResult(id,0.1,{model:usage(5,0.1)});
+  t.addDelegated(0.2,{model:child});
+  t.onResult(id,0.3,{model:usage(15,0.3)});
+  assert.ok(Math.abs(t.sessionCost-0.5)<1e-9);
+  assert.equal(t.ledger.byModel.model.inputTokens,25);
+  const resumed = new CostTracker(id,10);
+  resumed.onResult(id,0.4,{model:usage(20,0.4)});
+  assert.ok(Math.abs(resumed.sessionCost-0.6)<1e-9);
+  assert.equal(resumed.ledger.byModel.model.inputTokens,30);
+  const reset = new CostTracker(id,10);
+  reset.onResult(id,0.1,{model:usage(5,0.1)});
+  assert.ok(Math.abs(reset.sessionCost-0.7)<1e-9);
+  assert.equal(reset.ledger.byModel.model.inputTokens,35);
+});
+
+
+test('서브에이전트 권한: 상속·상한·동적 하향·plan·비대화형 정책', async () => {
+  const { childPermissionState, PermissionQueue } = await import('../dist/permissions.js');
+  const parent = newPermissionState('plan');
+  assert.throws(() => childPermissionState(parent,'acceptEdits'), /부모 권한/);
+  assert.throws(() => childPermissionState(parent,'default'), /부모 권한/);
+  const inherited = childPermissionState(parent);
+  parent.mode = 'bypass';
+  assert.equal(inherited.mode, 'bypass');
+  const restricted = childPermissionState(parent,'acceptEdits');
+  parent.mode = 'plan';
+  assert.equal(restricted.mode, 'plan');
+  parent.mode = 'bypass';
+  assert.equal(restricted.mode,'acceptEdits');
+  const guard = new PathGuard(tmpHome);
+  const opts = { signal: new AbortController().signal };
+  for (const [mode,write,shell] of [['plan','deny','deny'],['default','deny','deny'],['acceptEdits','allow','deny'],['bypass','allow','allow']]) {
+    parent.mode = mode;
+    const check = makeCanUseTool({guard,state:childPermissionState(parent),queue:new PermissionQueue(),allowModeChange:false,write:()=>{}});
+    assert.equal((await check('Write',{file_path:path.join(tmpHome,'child.txt'),content:'x'},opts)).behavior,write);
+    assert.equal((await check('Bash',{command:'echo child'},opts)).behavior,shell);
+    assert.equal((await check('Write',{file_path:path.join(tmpHome,'..','outside')},opts)).behavior,'deny');
+    assert.equal((await check('Bash',{command:'echo rm -rf example'},opts)).behavior,'deny');
+  }
+});
+
+test('부모·자식 승인 직렬화 및 대기 중 권한 하향·취소', async () => {
+  const { childPermissionState, PermissionQueue } = await import('../dist/permissions.js');
+  const state = newPermissionState();
+  const queue = new PermissionQueue();
+  let release;
+  let started;
+  const ready = new Promise((resolve)=>started=resolve);
+  let asks=0;
+  const ask = () => {asks++; started(); return new Promise((resolve)=>release=resolve);};
+  const deps={guard:new PathGuard(tmpHome),queue,ask,write:()=>{}};
+  const parent = makeCanUseTool({...deps,state});
+  const child = makeCanUseTool({...deps,state:childPermissionState(state),allowModeChange:false});
+  const opts={signal:new AbortController().signal};
+  const first=parent('Write',{file_path:path.join(tmpHome,'one')},opts);
+  await ready;
+  const abort=new AbortController();
+  const second=child('Write',{file_path:path.join(tmpHome,'two')},{signal:abort.signal});
+  abort.abort();
+  state.mode='plan';
+  release('y');
+  assert.equal((await first).behavior,'deny');
+  assert.equal((await second).behavior,'deny');
+  assert.equal(asks,1);
+});

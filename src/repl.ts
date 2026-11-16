@@ -1,4 +1,5 @@
 import readline from 'node:readline';
+import { TerminalInput } from './terminal-input.js';
 import chalk from 'chalk';
 import { listSessions } from '@anthropic-ai/claude-agent-sdk';
 import { AgentSession } from './agent.js';
@@ -32,7 +33,7 @@ ${chalk.bold('내부 명령어')}
   /exit              CLI 종료
 
 ${chalk.bold('입력')}
-  줄 끝에 \\ 를 붙이면 여러 줄 입력, Shift+Tab 으로 권한 모드 전환(default → acceptEdits → plan)
+  Enter: 줄바꿈 · Ctrl+Enter: 전송 (TTY) · 여러 줄 붙여넣기 지원\n  줄 끝 \\ 연결 입력은 파이프에서 유지, Shift+Tab 으로 권한 모드 전환(default → acceptEdits → plan)
   Ctrl+C 로 실행 중단, 대기 중 Ctrl+C 두 번 또는 Ctrl+D 로 종료
 `;
 
@@ -42,11 +43,16 @@ function fmtUsd(n: number): string {
 
 export async function runRepl(ctx: ReplContext): Promise<void> {
   const { cfg } = ctx;
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdin.isTTY, historySize: 500 });
+  let atMainPrompt = false;
+  const terminal = process.stdin.isTTY ? new TerminalInput(process.stdin, process.stdout, () => atMainPrompt) : undefined;
+  const input = terminal ?? process.stdin;
+  const rl = readline.createInterface({ input, output: process.stdout, terminal: process.stdin.isTTY, historySize: 500 });
   const lines: string[] = [];
   const waiters: ((l: string | null) => void)[] = [];
   let closed = false;
-  rl.on('line', (l) => {
+  rl.on('line', (line) => {
+    const l = terminal ? terminal.acceptLine(line) : line;
+    if (l === undefined) { rl.setPrompt(chalk.dim('… ')); rl.prompt(); return; }
     const w = waiters.shift();
     if (w) w(l);
     else lines.push(l);
@@ -55,7 +61,8 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     closed = true;
     for (const w of waiters.splice(0)) w(null);
   });
-  const readLine = (prompt: string): Promise<string | null> => {
+  const readLine = (prompt: string, signal?: AbortSignal): Promise<string | null> => {
+    if (signal?.aborted) return Promise.resolve(null);
     if (lines.length) {
       if (!process.stdin.isTTY) process.stdout.write(prompt);
       return Promise.resolve(lines.shift()!);
@@ -63,13 +70,18 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     if (closed) return Promise.resolve(null);
     rl.setPrompt(prompt);
     rl.prompt();
-    return new Promise((resolve) => waiters.push(resolve));
+    return new Promise((resolve) => {
+      const finish = (line: string | null) => { signal?.removeEventListener('abort', abort); resolve(line); };
+      const abort = () => { const i = waiters.indexOf(finish); if (i >= 0) waiters.splice(i, 1); finish(null); };
+      waiters.push(finish);
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+    });
   };
-  const ask = async (q: string) => (await readLine(q)) ?? 'n';
+  const ask = async (q: string, signal?: AbortSignal) => (await readLine(q, signal)) ?? 'n';
 
   const guard = new PathGuard(cfg.cwd, cfg.additionalDirectories);
   const permState = newPermissionState(cfg.permissionMode);
-  let atMainPrompt = false;
   const modeTag = () => {
     const m = permState.mode;
     if (m === 'default') return '';
@@ -89,6 +101,8 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     session = new AgentSession({
       apiKey: ctx.apiKey,
       model,
+      effort: cfg.effort,
+      subagentTools: cfg.subagentTools,
       cwd: cfg.cwd,
       resume,
       continueLast,
@@ -114,6 +128,9 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
       rl.close();
       return;
     }
+    terminal?.cancelDraft();
+    rl.write(null, { ctrl: true, name: 'a' });
+    rl.write(null, { ctrl: true, name: 'k' });
     sigintAt = now;
     process.stdout.write(ui.dim('\n(한 번 더 Ctrl+C 를 누르면 종료합니다)\n'));
     rl.prompt();
@@ -121,7 +138,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
   rl.on('SIGINT', onSigint);
   // Shift+Tab: 입력 대기 중일 때 권한 모드 순환
   if (process.stdin.isTTY) {
-    process.stdin.on('keypress', (_s: string, key: { name?: string; shift?: boolean } | undefined) => {
+    input.on('keypress', (_s: string, key: { name?: string; shift?: boolean } | undefined) => {
       if (!atMainPrompt || session.busy || key?.name !== 'tab' || !key.shift) return;
       const i = CYCLE_MODES.indexOf(permState.mode);
       permState.mode = CYCLE_MODES[(i + 1) % CYCLE_MODES.length];
@@ -142,7 +159,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
       `Budget: ${fmtUsd(cfg.maxSessionCostUsd)} / session ${ui.dim('(CLI 자체 추정 한도 — 실제 청구 차단을 보장하지 않음)')}\n` +
       `Permission mode: ${chalk.bold(permState.mode)} ${ui.dim(`— ${MODE_INFO[permState.mode].desc}`)}\n` +
       (ctx.resume ? `Resume: ${ctx.resume}\n` : '') +
-      ui.dim('/help 로 명령어 확인\n'),
+      ui.dim('/help 로 명령어 확인 · Enter 줄바꿈 / Ctrl+Enter 전송 (승인 질문은 Enter)\n'),
   );
 
   const listRecent = async () => {
@@ -310,58 +327,65 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     },
   };
 
-  for (;;) {
-    atMainPrompt = true;
-    let text = await readLine(mainPrompt());
-    atMainPrompt = false;
-    if (text === null) break;
-    while (text.endsWith('\\')) {
-      const more = await readLine(chalk.dim('… '));
-      if (more === null) break;
-      text = text.slice(0, -1) + '\n' + more;
-    }
-    const trimmed = text.trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith('/')) {
-      const [name, ...rest] = trimmed.slice(1).split(/\s+/);
-      const fn = commands[name.toLowerCase()];
-      if (!fn) {
-        process.stdout.write(ui.err(`알 수 없는 명령어: /${name}  (/help)\n`));
+  try {
+    for (;;) {
+      atMainPrompt = true;
+      let text = await readLine(mainPrompt());
+      atMainPrompt = false;
+      if (text === null) break;
+      while (!terminal && text.endsWith('\\')) {
+        const more = await readLine(chalk.dim('… '));
+        if (more === null) break;
+        text = text.slice(0, -1) + '\n' + more;
+      }
+      const trimmed = text.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith('/')) {
+        const [name, ...rest] = trimmed.slice(1).split(/\s+/);
+        const fn = commands[name.toLowerCase()];
+        if (!fn) {
+          process.stdout.write(ui.err(`알 수 없는 명령어: /${name}  (/help)\n`));
+          continue;
+        }
+        try {
+          if (await fn(rest.join(' '))) break;
+        } catch (err) {
+          process.stdout.write(ui.err(`명령 실패: ${err instanceof Error ? err.message : String(err)}\n`));
+        }
         continue;
       }
       try {
-        if (await fn(rest.join(' '))) break;
+        const outcome = await session.send(trimmed);
+        if (outcome.error) process.stdout.write(ui.err(`\n✖ ${outcome.error}\n`));
+        const r = outcome.result;
+        const last = tracker.ledger.requests.at(-1);
+        process.stdout.write(
+          ui.dim(
+            `\n─ 이번 턴 ${fmtUsd(outcome.turnCostUsd)}` +
+              (last ? ` · 마지막 요청 in ${last.inputTokens}/out ${last.outputTokens} 토큰` : '') +
+              ` · 세션 누적 ${fmtUsd(tracker.sessionCost)} / ${fmtUsd(cfg.maxSessionCostUsd)}` +
+              (r ? ` · ${(r.duration_ms / 1000).toFixed(1)}s` : '') +
+              '\n',
+          ),
+        );
+        if (tracker.sessionCost >= cfg.maxSessionCostUsd) {
+          process.stdout.write(ui.warn('⚠ 세션 예산 한도에 도달했습니다. 추가 요청은 차단됩니다(/clear 로 새 세션 시작 또는 한도 조정).\n'));
+        }
+        if (session.dead) {
+          process.stdout.write(ui.err(`세션이 종료되었습니다: ${session.dead}\n/clear 로 새 세션을 시작할 수 있습니다.\n`));
+        }
       } catch (err) {
-        process.stdout.write(ui.err(`명령 실패: ${err instanceof Error ? err.message : String(err)}\n`));
+        if (err instanceof BudgetExceededError) process.stdout.write(ui.err(`✖ ${err.message}\n`));
+        else process.stdout.write(ui.err(`✖ ${err instanceof Error ? err.message : String(err)}\n`));
       }
-      continue;
     }
-    try {
-      const outcome = await session.send(trimmed);
-      if (outcome.error) process.stdout.write(ui.err(`\n✖ ${outcome.error}\n`));
-      const r = outcome.result;
-      const last = tracker.ledger.requests.at(-1);
-      process.stdout.write(
-        ui.dim(
-          `\n─ 이번 턴 ${fmtUsd(outcome.turnCostUsd)}` +
-            (last ? ` · 마지막 요청 in ${last.inputTokens}/out ${last.outputTokens} 토큰` : '') +
-            ` · 세션 누적 ${fmtUsd(tracker.sessionCost)} / ${fmtUsd(cfg.maxSessionCostUsd)}` +
-            (r ? ` · ${(r.duration_ms / 1000).toFixed(1)}s` : '') +
-            '\n',
-        ),
-      );
-      if (tracker.sessionCost >= cfg.maxSessionCostUsd) {
-        process.stdout.write(ui.warn('⚠ 세션 예산 한도에 도달했습니다. 추가 요청은 차단됩니다(/clear 로 새 세션 시작 또는 한도 조정).\n'));
-      }
-      if (session.dead) {
-        process.stdout.write(ui.err(`세션이 종료되었습니다: ${session.dead}\n/clear 로 새 세션을 시작할 수 있습니다.\n`));
-      }
-    } catch (err) {
-      if (err instanceof BudgetExceededError) process.stdout.write(ui.err(`✖ ${err.message}\n`));
-      else process.stdout.write(ui.err(`✖ ${err instanceof Error ? err.message : String(err)}\n`));
+  } finally {
+    try { await session.close(); }
+    finally {
+      rl.close();
+      terminal?.dispose();
+      if (!process.stdin.isTTY) process.off('SIGINT', onSigint);
     }
   }
-  await session.close();
-  rl.close();
   process.stdout.write(ui.dim(`\n종료합니다.${session.sessionId ? ` 세션 ID: ${session.sessionId} (cvp --resume ${session.sessionId})` : ''}\n`));
 }

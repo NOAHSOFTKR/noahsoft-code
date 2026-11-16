@@ -71,6 +71,7 @@ const STRIPPED_ENV = [
   'ANTHROPIC_IDENTITY_TOKEN_FILE',
   // 이 CLI가 직접 고르는 값과 충돌하지 않도록 제거
   'ANTHROPIC_MODEL',
+  'CLAUDE_CODE_EFFORT_LEVEL',
   'ANTHROPIC_SMALL_FAST_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -93,5 +94,8 @@ export function buildAgentEnv(apiKey: string): Record<string, string | undefined
   // 텔레메트리·자동 업데이트 등 부가 트래픽 차단
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
   env.DISABLE_AUTOUPDATER = '1';
+  env.CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS = '1';
+  env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = '1';
+  env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = '3';
   return env;
 }
