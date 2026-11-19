@@ -1,3 +1,4 @@
+import { modelCompletion } from './model-input.js';
 import type { InterruptKey } from './config.js';
 import { InkInput } from './ink-input.js';
 import { EventEmitter } from 'node:events';
@@ -16,6 +17,12 @@ export class InteractiveInput extends EventEmitter {
   transcript = '';
   queue: string[] = [];
   panelVisible = true;
+  modelIds: string[] = [];
+  get modelSuggestion() {
+    return !this.question && this.cursor === this.draft.length
+      ? modelCompletion(this.draft, this.modelIds)
+      : undefined;
+  }
   scroll = 0;
   maxScroll = 0;
   scrollTranscript(rows: number) {
@@ -36,6 +43,41 @@ export class InteractiveInput extends EventEmitter {
   shiftEnterAction: 'newline' | 'queue' | 'interrupt' = 'interrupt';
   slashEnterSubmit = true;
   interruptKey?: InterruptKey;
+  private promptHistory: string[] = [];
+  private historyIndex?: number;
+  private preferredColumn?: number;
+
+  private resetNavigation() {
+    this.historyIndex = undefined;
+    this.preferredColumn = undefined;
+  }
+
+  private moveVertical(direction: -1 | 1) {
+    const start = this.cursor === 0 ? 0 : this.draft.lastIndexOf('\n', this.cursor - 1) + 1;
+    const end = this.draft.indexOf('\n', this.cursor);
+    const hasAdjacentLine = direction === -1 ? start > 0 : end !== -1;
+    if (hasAdjacentLine) {
+      const targetStart = direction === -1
+        ? (start > 1 ? this.draft.lastIndexOf('\n', start - 2) + 1 : 0)
+        : end + 1;
+      const targetEnd = direction === -1 ? start - 1 : this.draft.indexOf('\n', targetStart);
+      const line = this.draft.slice(targetStart, targetEnd === -1 ? undefined : targetEnd);
+      this.preferredColumn ??= [...this.draft.slice(start, this.cursor)].length;
+      this.cursor = targetStart + [...line].slice(0, this.preferredColumn).join('').length;
+      this.changed();
+      return;
+    }
+
+    if (this.historyIndex === undefined && (direction === 1 || this.draft !== '')) return;
+    const next = (this.historyIndex ?? this.promptHistory.length) + direction;
+    if (next < 0 || next > this.promptHistory.length) return;
+    this.historyIndex = next === this.promptHistory.length ? undefined : next;
+    this.draft = this.promptHistory[next] ?? '';
+    this.cursor = this.draft.length;
+    this.preferredColumn = undefined;
+    this.changed();
+  }
+
   private waiter?: (value: string | null) => void;
   private questions: Question[] = [];
   get question() { return this.questions[0]; }
@@ -46,15 +88,24 @@ export class InteractiveInput extends EventEmitter {
     if (pasted && this.question) return;
     const value = clean(text);
     if (this.question) this.question.draft += value.replace(/\n/g, '');
-    else { this.draft = this.draft.slice(0, this.cursor) + value + this.draft.slice(this.cursor); this.cursor += value.length; }
+    else if (value) {
+      this.resetNavigation();
+      this.draft = this.draft.slice(0, this.cursor) + value + this.draft.slice(this.cursor);
+      this.cursor += value.length;
+    }
     this.changed();
   }
   submit(interrupt = false) {
     if (this.closed) return;
     if (this.question) { const q = this.questions.shift()!; q.cleanup(); q.resolve(q.draft); this.changed(); return; }
-    const value = this.draft; this.draft = ''; this.cursor = 0;
+    const value = this.draft;
+    this.cancelDraft(false);
     if (!value.trim()) { this.changed(); return; }
     if (value.trim() === '/status') { this.panelVisible = !this.panelVisible; this.changed(); return; }
+    if (!value.trimStart().startsWith('/') && this.promptHistory.at(-1) !== value) {
+      this.promptHistory.push(value);
+      if (this.promptHistory.length > 100) this.promptHistory.shift();
+    }
     this.write(`\n> ${value}\n`);
     if (interrupt) this.onInterruptPrompt();
     if (this.waiter) { const resolve = this.waiter; this.waiter = undefined; resolve(value); }
@@ -83,6 +134,13 @@ export class InteractiveInput extends EventEmitter {
     if (key.ctrl && input === 'c') { this.onInterrupt(); return; }
     if (key.ctrl && input === 'd') { this.onInterruptPrompt(); this.close(); return; }
     if (key.tab && key.shift && !this.question) { this.onCycle(); return; }
+    if (key.tab && !this.question && this.modelSuggestion) {
+      this.resetNavigation();
+      this.draft = this.modelSuggestion;
+      this.cursor = this.draft.length;
+      this.changed();
+      return;
+    }
     if (key.tab && !this.question) { this.statusFocused = !this.statusFocused; this.changed(); return; }
     if (key.pageUp || key.pageDown) { if (this.statusFocused) this.statusScroll = Math.max(0, Math.min(this.status().length - 1, this.statusScroll + (key.pageUp ? -5 : 5))); else { this.scrollTranscript(key.pageUp ? 10 : -10); return; } this.changed(); return; }
     if (this.interruptKey && key.ctrl && !key.shift && !key.meta && !key.super &&
@@ -100,13 +158,19 @@ export class InteractiveInput extends EventEmitter {
       }
       return;
     }
+    if (key.upArrow || key.downArrow) {
+      if (!this.question) this.moveVertical(key.upArrow ? -1 : 1);
+      return;
+    }
     if (key.backspace || key.delete) {
+      if (!this.question) this.resetNavigation();
       if (this.question) this.question.draft = this.question.draft.slice(0, -1);
       else if (key.delete) this.draft = this.draft.slice(0, this.cursor) + this.draft.slice(this.cursor + ([...this.draft.slice(this.cursor)][0]?.length ?? 0));
       else if (this.cursor > 0) { const previous = [...this.draft.slice(0, this.cursor)].at(-1)!; this.draft = this.draft.slice(0, this.cursor - previous.length) + this.draft.slice(this.cursor); this.cursor -= previous.length; }
       this.changed(); return;
     }
     if (!this.question && (key.leftArrow || key.rightArrow || key.home || key.end)) {
+      this.preferredColumn = undefined;
       if (key.home) this.cursor = 0; else if (key.end) this.cursor = this.draft.length;
       else if (key.leftArrow) this.cursor -= [...this.draft.slice(0, this.cursor)].at(-1)?.length ?? 0;
       else this.cursor += [...this.draft.slice(this.cursor)][0]?.length ?? 0;
@@ -120,7 +184,12 @@ export class InteractiveInput extends EventEmitter {
     for (const q of this.questions.splice(0)) { q.cleanup(); q.resolve(null); }
     this.changed();
   }
-  cancelDraft() { this.draft = ''; this.cursor = 0; this.changed(); }
+  cancelDraft(notify = true) {
+    this.draft = '';
+    this.cursor = 0;
+    this.resetNavigation();
+    if (notify) this.changed();
+  }
 }
 
 function Screen({ input }: { input: InteractiveInput }) {
@@ -160,7 +229,7 @@ function Screen({ input }: { input: InteractiveInput }) {
       </Box>
       {input.panelVisible && <Box width={side ? 42 : width} height={side ? undefined : 5} borderStyle="round" borderColor={input.statusFocused ? "cyan" : "gray"} flexDirection="column" flexShrink={0} overflow="hidden"><Text bold>상태 · Tab/PgUp/PgDn 이동</Text><Text wrap="wrap">{wrapAnsi(input.status().map(clean).join('\n'), side ? 40 : Math.max(1, width - 2), { hard: true }).split('\n').slice(input.statusScroll).join('\n')}</Text></Box>}
     </Box>
-    <Text dimColor wrap="truncate-end">Enter {input.enterAction} · Ctrl+Enter {input.ctrlEnterAction} · Shift+Enter {input.shiftEnterAction}{input.interruptKey ? ` · ${input.interruptKey} interrupt` : ''} · 휠/PgUp/PgDn 기록 · Shift+드래그 선택</Text>
+    <Text dimColor wrap="truncate-end">{input.modelSuggestion ? `Tab 자동완성 · ${input.modelSuggestion}` : <>Enter {input.enterAction} · Ctrl+Enter {input.ctrlEnterAction} · Shift+Enter {input.shiftEnterAction}{input.interruptKey ? ` · ${input.interruptKey} interrupt` : ''} · 휠/PgUp/PgDn 기록 · Shift+드래그 선택</>}</Text>
   </Box>;
 }
 

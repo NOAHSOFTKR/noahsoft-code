@@ -38,3 +38,38 @@ test('Unicode cursor editing and key release never duplicate submissions',()=>{
  const ui=new InteractiveInput();ui.insert('a😀b');ui.key('',{home:true});ui.key('',{rightArrow:true});ui.key('',{delete:true});assert.equal(ui.draft,'ab');
  ui.key('',{...ctrlEnter,eventType:'release'});assert.equal(ui.queue.length,0);ui.close();
 });
+
+test('arrows preserve the preferred column across empty lines and emoji', () => {
+ const ui = new InteractiveInput();
+ ui.insert('a😀c\n\n12345');
+ ui.key('', {leftArrow:true});
+ ui.key('', {leftArrow:true});
+ ui.key('', {upArrow:true});
+ assert.equal(ui.cursor, 'a😀c\n'.length);
+ ui.key('', {upArrow:true});
+ assert.equal(ui.cursor, 'a😀c'.length);
+ ui.key('', {downArrow:true});
+ ui.key('', {downArrow:true});
+ assert.equal(ui.cursor, 'a😀c\n\n123'.length);
+ ui.close();
+});
+
+test('empty Up recalls submitted prompts without sending or answering approvals', async () => {
+ const ui = new InteractiveInput();
+ ui.insert('first'); ui.submit();
+ ui.insert('/help'); ui.submit();
+ ui.insert('last'); ui.submit(true);
+ const queued = [...ui.queue];
+ const up = {upArrow:true}, down = {downArrow:true};
+ const answer = ui.ask('allow?');
+ ui.key('', up);
+ assert.equal(ui.draft, '');
+ ui.insert('n'); ui.key('', enter);
+ assert.equal(await answer, 'n');
+ ui.key('', up); assert.equal(ui.draft, 'last');
+ ui.key('', up); assert.equal(ui.draft, 'first');
+ ui.key('', down); assert.equal(ui.draft, 'last');
+ ui.key('', down); assert.equal(ui.draft, '');
+ assert.deepEqual(ui.queue, queued);
+ ui.close();
+});

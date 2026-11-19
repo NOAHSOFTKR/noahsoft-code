@@ -1,3 +1,4 @@
+import { parseModelInput } from './model-input.js';
 import readline from 'node:readline';
 import { PassThrough } from 'node:stream';
 import { InteractiveInput, startInteractiveUi } from './interactive-ui.js';
@@ -168,6 +169,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
   };
   rl.on('SIGINT', onSigint);
   if (interactive) {
+    interactive.modelIds = [ctx.model];
     interactive.onInterrupt = onSigint;
     interactive.enterAction = cfg.enterAction;
     interactive.ctrlEnterAction = cfg.ctrlEnterAction;
@@ -348,6 +350,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     },
     async models() {
       const ms = await listModels(apiClient(ctx.apiKey));
+      if (interactive) interactive.modelIds = [...new Set([session.activeModel, ...ms.map(item => item.id)])];
       write(chalk.bold('조회 가능한 모델 (권한 미검증)\n'));
       for (const m of ms) write(`  ${m.id === model ? '*' : ' '} ${m.id.padEnd(30)} ${ui.dim(m.displayName)}\n`);
       write(ui.dim('  실제 호출 권한은 /model <id> 또는 cvp models --verify 로 확인하세요.\n'));
@@ -393,9 +396,9 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
       return commands.mode(arg);
     },
     async model(arg) {
-      const id = arg.trim();
+      const id = parseModelInput(arg);
       if (!id) {
-        write(`현재 모델: ${chalk.bold(session.activeModel)}\n${ui.dim('변경: /model <model-id>  (목록: /models)')}\n`);
+        write(`현재 모델: ${chalk.bold(session.activeModel)}\n${ui.dim('변경: /model <model-id> 또는 /model Provider: claude Model-Group: opus Model: 5.5  (목록: /models)')}\n`);
         return;
       }
       if (session.busy) return;
@@ -411,6 +414,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
       }
       await session.setModel(id);
       model = id;
+      if (interactive && !interactive.modelIds.includes(id)) interactive.modelIds.push(id);
       write(ui.ok(`✔ 모델을 ${id} 로 변경했습니다. (영구 저장: cvp config set model ${id})\n`));
     },
   };
