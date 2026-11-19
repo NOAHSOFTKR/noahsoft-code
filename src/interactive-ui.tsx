@@ -54,6 +54,55 @@ export class InteractiveInput extends EventEmitter {
     return this.enhanced && !this.detailedStatus ? this.summaryStatus() : this.status();
   }
   private queueRevision = 0;
+  queueSelection?: { index: number; revision: number };
+  private suppressRecallRepeat = false;
+  get canRestoreDraft() { return this.stashedDrafts.length > 0; }
+
+  private restoreDraft() {
+    const restored = this.stashedDrafts.pop();
+    if (restored !== undefined) this.useDraft(restored);
+  }
+
+  private handleInlineQueue(input: string, key: Partial<Key>): boolean {
+    const alt = key.meta && !key.ctrl && !key.shift && !key.super && !key.hyper;
+    if (alt && input === 'd' && !this.queueSelection && this.canRestoreDraft) {
+      if (key.eventType !== 'repeat') this.restoreDraft();
+      return true;
+    }
+    if (alt && input === 'q' && !this.queueSelection && this.queue.length) {
+      this.queueSelection = { index: this.queue.length - 1, revision: this.queueRevision };
+      this.changed();
+      return true;
+    }
+
+    const selection = this.queueSelection;
+    if (!selection) return false;
+    if (key.escape) {
+      this.queueSelection = undefined;
+      this.changed();
+    } else if (!(key.ctrl || key.shift || key.meta || key.super || key.hyper)) {
+      if (key.upArrow || key.downArrow || (key.return && key.eventType !== 'repeat')) {
+        if (selection.revision !== this.queueRevision) {
+          this.queueSelection = this.queue.length
+            ? { index: Math.min(selection.index, this.queue.length - 1), revision: this.queueRevision }
+            : undefined;
+          this.write('대기열이 바뀌었어요. 표시된 요청을 다시 선택해 주세요.\n');
+        } else if (key.return) {
+          const [entry] = this.queue.splice(selection.index, 1);
+          this.queueRevision++;
+          this.queueSelection = undefined;
+          if (entry !== undefined) {
+            this.suppressRecallRepeat = true;
+            this.useDraft(entry);
+          }
+        } else {
+          selection.index = Math.max(0, Math.min(this.queue.length - 1, selection.index + (key.upArrow ? -1 : 1)));
+          this.changed();
+        }
+      }
+    }
+    return true;
+  }
   transcriptViewWidth = 80;
   transcriptViewRows = 18;
 
@@ -285,6 +334,7 @@ export class InteractiveInput extends EventEmitter {
     }
     // Pasted text must never answer an approval question.
     if (pasted && this.question) return;
+    if (pasted) this.queueSelection = undefined;
     const value = clean(text);
     if (this.question) this.question.draft += value.replace(/\n/g, '');
     else if (value) {
@@ -367,10 +417,13 @@ export class InteractiveInput extends EventEmitter {
   }
   key(input: string, key: Partial<Key>) {
     if (key.eventType === 'release') return;
+    if (this.suppressRecallRepeat && key.eventType === 'repeat' && key.return) return;
+    this.suppressRecallRepeat = false;
     // A held menu-selection key must not submit the recalled draft.
     if (this.enhanced && key.eventType === 'repeat' && key.return && !this.question) return;
     if (key.ctrl && input === 'c') { this.onInterrupt(); return; }
     if (key.ctrl && input === 'd') { this.onInterruptPrompt(); this.close(); return; }
+    if (!this.question && !this.workspace && this.handleInlineQueue(input, key)) return;
     if (key.meta && !key.ctrl && !key.shift && !key.super && !key.hyper && input === 's') {
       if (!this.question && !this.workspace && key.eventType !== 'repeat') this.submitSteer();
       return;
@@ -437,6 +490,7 @@ export class InteractiveInput extends EventEmitter {
   close() {
     if (this.closed) return;
     this.workspace = undefined;
+    this.queueSelection = undefined;
     this.closed = true; this.queue = []; this.waiter?.(null); this.waiter = undefined;
     for (const q of this.questions.splice(0)) { q.cleanup(); q.resolve(null); }
     this.changed();
@@ -506,9 +560,11 @@ function Screen({ input }: { input: InteractiveInput }) {
   const rows = useMemo(() => layoutDraft(input.draft, input.draftWidth), [input.draft, input.draftWidth]);
   const questionRows = input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').length : 1;
   const inputLines = input.question ? Math.min(10, questionRows + 1) : Math.min(7, Math.max(2, rows.length + 1));
-  const pending = input.queue.at(-1);
-  const showQueuePreview = pending !== undefined && !input.question;
-  const transcriptRows = Math.max(1, height - inputLines - (side || !input.panelVisible ? 6 : 11) - (showQueuePreview ? 2 : 0));
+  const queueRows = input.question ? 0 : Math.min(input.queue.length, height < 22 ? 1 : 3);
+  const selectedQueueIndex = Math.min(input.queueSelection?.index ?? input.queue.length - 1, input.queue.length - 1);
+  const queueStart = Math.max(0, Math.min(selectedQueueIndex, input.queue.length - queueRows));
+  const showQueue = !input.question && (queueRows > 0 || !!input.queueSelection);
+  const transcriptRows = Math.max(1, height - inputLines - (side || !input.panelVisible ? 6 : 11) - (showQueue ? queueRows + 1 : 0));
   const history = useMemo(() => wrapAnsi(input.transcript, Math.max(1, paneWidth), { hard: true }).split('\n'), [input.transcript, paneWidth]);
   input.maxScroll = Math.max(0, history.length - transcriptRows);
   const end = history.length - Math.min(input.scroll, input.maxScroll);
@@ -533,12 +589,20 @@ function Screen({ input }: { input: InteractiveInput }) {
       : <Box flexGrow={1} flexDirection={side ? 'row' : 'column'}>
       <Box flexDirection="column" flexGrow={1} flexShrink={0} width={paneWidth} height={side || !input.panelVisible ? height - 3 : height - 8}>
         <Box flexGrow={1} flexShrink={1} minHeight={1} overflow="hidden"><Text wrap="wrap">{visible}</Text></Box>
-        {showQueuePreview && <Box flexDirection="column" flexShrink={0}>
-          <Text color="yellow" wrap="truncate-end">대기 {input.queue.length}개 · 빈 입력창에서 ↑ 표시된 요청 회수</Text>
-          <Text wrap="truncate-end">{pending.replace(/\s+/g, ' ').trim()}</Text>
+        {showQueue && <Box flexDirection="column" flexShrink={0}>
+          <Text color="yellow" wrap="truncate-end">
+            대기 {input.queue.length}개 · {input.queueSelection ? '↑↓ 선택 · Enter 회수 · Esc 닫기' : 'Alt+Q 목록 선택 · 빈 입력창 ↑ 마지막 요청 회수'}
+          </Text>
+          {input.queue.slice(queueStart, queueStart + queueRows).map((request, index) => {
+            const position = queueStart + index;
+            const selected = !!input.queueSelection && position === selectedQueueIndex;
+            return <Text key={position} color={selected ? 'cyan' : undefined} wrap="truncate-end">
+              {selected ? '› ' : '  '}{position + 1}. {request.replace(/\s+/g, ' ').trim()}
+            </Text>;
+          })}
         </Box>}
         <Box borderStyle="round" borderColor={input.question ? 'yellow' : 'green'} flexDirection="column" flexShrink={0} height={inputLines + 2} overflow="hidden">
-          <Text color={input.question ? 'yellow' : 'green'}>{input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').slice(-(inputLines - 1)).join('\n') : input.prompt}</Text>
+          <Text color={input.question ? 'yellow' : 'green'}>{input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').slice(-(inputLines - 1)).join('\n') : input.prompt + (input.canRestoreDraft ? ' · Alt+D 보관 초안 복구' : '')}</Text>
           <Text>{visibleDraft}</Text>
         </Box>
       </Box>

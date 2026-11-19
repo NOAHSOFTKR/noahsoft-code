@@ -206,3 +206,40 @@ test('Alt+S sends a separate Steer action and keeps drafts when unavailable', as
  assert.match(ui.transcript, /Steer · 반영 확인 대기/);
  ui.close();
 });
+
+test('inline queue recalls only the chosen item and restores the existing draft', () => {
+ const ui = new InteractiveInput();
+ for (const request of ['first', 'edit middle', 'last']) { ui.insert(request); ui.submit(); }
+ ui.insert('original draft');
+ ui.key('q', {meta:true});
+ ui.key('', {upArrow:true});
+ ui.key('', enter);
+ assert.equal(ui.draft, 'edit middle');
+ assert.deepEqual(ui.queue, ['first', 'last']);
+ ui.key('', {...enter,eventType:'repeat'});
+ assert.deepEqual(ui.queue, ['first', 'last']);
+ ui.key('d', {meta:true});
+ assert.equal(ui.draft, 'original draft');
+ assert.deepEqual(ui.queue, ['first', 'last']);
+ ui.close();
+});
+
+test('inline selection cannot recall the wrong item when the queue drains', async () => {
+ const ui = new InteractiveInput();
+ for (const request of ['first', 'middle', 'last']) { ui.insert(request); ui.submit(); }
+ ui.insert('draft');
+ ui.key('q', {meta:true});
+ ui.key('', {upArrow:true});
+ assert.equal(await ui.readLine('> '), 'first');
+ ui.key('', enter);
+ assert.equal(ui.draft, 'draft');
+ assert.deepEqual(ui.queue, ['middle', 'last']);
+ ui.key('', {escape:true});
+ assert.equal(ui.queueSelection, undefined);
+ const answer = ui.ask('allow?');
+ ui.key('q', {meta:true});
+ ui.insert('n'); ui.key('', enter);
+ assert.equal(await answer, 'n');
+ assert.equal(ui.draft, 'draft');
+ ui.close();
+});
