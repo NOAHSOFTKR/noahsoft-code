@@ -106,6 +106,8 @@ cvp config set budget 2.5            # 세션 예산 저장
 
 대화형 터미널은 Ink 기반으로 왼쪽에 대화·입력창, 오른쪽에 상태 패널을 기본 표시합니다. `/status`로 패널을 숨기거나 다시 표시합니다. 상태는 로컬 세션 정보로 갱신하며 화면 갱신만을 위한 모델 API 호출은 하지 않습니다. 폭이 좁은 터미널에서는 패널을 아래에 배치합니다. Tab으로 상태 패널 이동을 선택하고 PgUp/PgDn으로 가려진 항목을 볼 수 있습니다.
 
+마우스 휠이나 PgUp/PgDn으로 대화 기록을 볼 수 있습니다. Windows Terminal에서는 Shift를 누른 채 드래그해 보이는 텍스트를 선택하고 Ctrl+Shift+C로 복사합니다. 기본 키 설정이라면 텍스트를 선택한 상태에서 Ctrl+C로도 복사할 수 있습니다. 선택 없이 Ctrl+C를 누르면 CVP에서 실행 중인 요청이 중단될 수 있습니다.
+
 기본 키 동작은 다음과 같습니다.
 
 | 키 | 동작 |
@@ -124,6 +126,22 @@ cvp config set slashEnterSubmit true
 ```
 
 `slashEnterSubmit false`로 설정하면 슬래시 명령에도 Enter의 지정 동작을 적용합니다. 전송할 수 있도록 Enter 계열 키 중 적어도 하나는 `queue` 또는 `interrupt`여야 합니다. 변경은 다음 실행부터 적용하며 `cvp config unset <설정키>`로 각 기본값을 복원합니다.
+
+Windows Terminal 세션에서는 시작할 때 키보드 확장 모드를 바로 켜서 Enter, Ctrl+Enter, Shift+Enter를 구분합니다. 다른 터미널에서는 지원 여부를 자동 감지합니다. Windows Terminal에서 Enter로 보내고 Shift+Enter로 줄을 바꾸려면 다음처럼 설정합니다.
+
+```powershell
+cvp config set enterAction queue
+cvp config set ctrlEnterAction interrupt
+cvp config set shiftEnterAction newline
+```
+
+터미널이 Shift+Enter를 구분하지 못하거나 다른 끼어들기 키를 쓰고 싶으면 추가 키를 지정할 수 있습니다. Ctrl+Enter는 기존 설정대로 동작합니다.
+
+```powershell
+cvp config set interruptKey ctrl+g
+```
+
+`ctrl+k` 또는 `ctrl+u`도 선택할 수 있습니다. 다음 실행부터 적용되며, `cvp config unset interruptKey`로 추가 키를 해제합니다. 승인 질문 중에는 이 키로 전송할 수 없습니다.
 
 Bracketed Paste를 지원하는 터미널에서는 여러 줄 붙여넣기를 하나의 입력으로 모으고 자동 전송하지 않습니다. Ctrl+Enter·Shift+Enter 구분은 터미널 지원과 키 설정에 달려 있습니다. Ctrl+J는 Ctrl+Enter 대체 입력입니다. 승인·확인 질문은 Enter로 답하며 일반 프롬프트 초안과 분리합니다. 파이프 입력에서는 줄 끝의 `\`로 여러 줄을 연결하는 기존 동작을 유지합니다. 실행 중 Ctrl+C는 현재 턴을 중단하고, 대기 중 Ctrl+C 두 번 또는 Ctrl+D는 종료합니다.
 

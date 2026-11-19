@@ -40,6 +40,7 @@ ${chalk.bold('내부 명령어')}
 
 ${chalk.bold('입력')}
   기본 Enter: 줄바꿈 · Ctrl+Enter: 대기 전송 · Shift+Enter: 중단 후 전송 (TTY)
+  추가 끼어들기 키: cvp config set interruptKey ctrl+g (ctrl+k, ctrl+u 가능)
   cvp config set enterAction/ctrlEnterAction/shiftEnterAction 으로 변경 · 한 줄 /명령은 Enter 실행\n  줄 끝 \\ 연결 입력은 파이프에서 유지, Shift+Tab 으로 권한 모드 전환(default → acceptEdits → plan)
   Ctrl+C 로 실행 중단, 대기 중 Ctrl+C 두 번 또는 Ctrl+D 로 종료
 `;
@@ -170,6 +171,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     interactive.onInterrupt = onSigint;
     interactive.enterAction = cfg.enterAction;
     interactive.ctrlEnterAction = cfg.ctrlEnterAction;
+    interactive.interruptKey = cfg.interruptKey;
     interactive.shiftEnterAction = cfg.shiftEnterAction;
     interactive.slashEnterSubmit = cfg.slashEnterSubmit;
     interactive.onInterruptPrompt = () => { if (session.busy) void interrupt(); };

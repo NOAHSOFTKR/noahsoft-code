@@ -1,3 +1,4 @@
+import type { InterruptKey } from './config.js';
 import { InkInput } from './ink-input.js';
 import { EventEmitter } from 'node:events';
 import { stripVTControlCharacters } from 'node:util';
@@ -16,6 +17,11 @@ export class InteractiveInput extends EventEmitter {
   queue: string[] = [];
   panelVisible = true;
   scroll = 0;
+  maxScroll = 0;
+  scrollTranscript(rows: number) {
+    this.scroll = Math.max(0, Math.min(this.maxScroll, this.scroll + rows));
+    this.changed();
+  }
   statusScroll = 0;
   statusFocused = false;
   closed = false;
@@ -29,11 +35,12 @@ export class InteractiveInput extends EventEmitter {
   ctrlEnterAction: 'newline' | 'queue' | 'interrupt' = 'queue';
   shiftEnterAction: 'newline' | 'queue' | 'interrupt' = 'interrupt';
   slashEnterSubmit = true;
+  interruptKey?: InterruptKey;
   private waiter?: (value: string | null) => void;
   private questions: Question[] = [];
   get question() { return this.questions[0]; }
   changed() { this.emit('change'); }
-  write = (text: string) => { this.transcript = (this.transcript + clean(text)).slice(-200_000); this.scroll = 0; this.changed(); };
+  write = (text: string) => { this.transcript = (this.transcript + clean(text)).slice(-200_000); this.changed(); };
   insert(text: string, pasted = false) {
     // Pasted text must never answer an approval question.
     if (pasted && this.question) return;
@@ -77,7 +84,12 @@ export class InteractiveInput extends EventEmitter {
     if (key.ctrl && input === 'd') { this.onInterruptPrompt(); this.close(); return; }
     if (key.tab && key.shift && !this.question) { this.onCycle(); return; }
     if (key.tab && !this.question) { this.statusFocused = !this.statusFocused; this.changed(); return; }
-    if (key.pageUp || key.pageDown) { if (this.statusFocused) this.statusScroll = Math.max(0, Math.min(this.status().length - 1, this.statusScroll + (key.pageUp ? -5 : 5))); else this.scroll = Math.max(0, this.scroll + (key.pageUp ? 10 : -10)); this.changed(); return; }
+    if (key.pageUp || key.pageDown) { if (this.statusFocused) this.statusScroll = Math.max(0, Math.min(this.status().length - 1, this.statusScroll + (key.pageUp ? -5 : 5))); else { this.scrollTranscript(key.pageUp ? 10 : -10); return; } this.changed(); return; }
+    if (this.interruptKey && key.ctrl && !key.shift && !key.meta && !key.super &&
+        this.interruptKey === `ctrl+${input}`) {
+      if (!this.question && key.eventType !== 'repeat') this.submit(true);
+      return;
+    }
     const enter = key.return || input === '\n' || (key.ctrl && input === 'j');
     if (enter) {
       if (this.question) this.submit();
@@ -118,22 +130,26 @@ function Screen({ input }: { input: InteractiveInput }) {
   useEffect(() => { const change = () => refresh(); input.on('change', change); const timer = setInterval(change, 1000); process.stdout.on('resize', change); return () => { input.off('change', change); clearInterval(timer); process.stdout.off('resize', change); }; }, [input]);
   useInput((value, key) => input.key(value, key));
   usePaste(value => input.insert(value, true));
-  const width = process.stdout.columns ?? 100, height = Math.max(12, process.stdout.rows ?? 30);
+  // Keep the final terminal column empty. Writing into it can trigger
+  // terminal autowrap and shift the rows Ink clears on the next frame.
+  const width = Math.max(1, (process.stdout.columns ?? 100) - 1);
+  const height = Math.max(12, process.stdout.rows ?? 30);
   const side = input.panelVisible && width >= 90;
   const paneWidth = side ? width - 42 : width;
   const questionRows = input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').length : 1;
   const inputLines = input.question ? Math.min(10, questionRows + 1) : Math.min(7, Math.max(2, wrapAnsi(input.draft, Math.max(1, paneWidth - 2), { hard: true }).split('\n').length + 1));
   const transcriptRows = Math.max(3, height - inputLines - (side || !input.panelVisible ? 6 : 11));
   const history = useMemo(() => wrapAnsi(input.transcript, Math.max(1, paneWidth), { hard: true }).split('\n'), [input.transcript, paneWidth]);
-  const end = Math.max(0, history.length - input.scroll);
+  input.maxScroll = Math.max(0, history.length - transcriptRows);
+  const end = history.length - Math.min(input.scroll, input.maxScroll);
   const visible = history.slice(Math.max(0, end - transcriptRows), end).join('\n');
   const draft = input.question ? input.question.draft : input.draft.slice(0, input.cursor) + '▌' + input.draft.slice(input.cursor);
   const wrappedDraft = wrapAnsi(draft, Math.max(1, paneWidth - 2), { hard: true });
   const cursorLine = wrapAnsi(input.draft.slice(0, input.cursor), Math.max(1, paneWidth - 2), { hard: true }).split('\n').length - 1;
   const draftStart = input.question ? 0 : Math.max(0, cursorLine - 3);
   if (!ready) return <Text>CVP UI 준비 중…</Text>;
-  return <Box flexDirection="column" width={width} height={height - 1}>
-    <Text bold color="cyan">CVP CLI · {input.busy() ? '작업 중' : '입력 가능'} · 전송 대기 {input.queue.length}개</Text>
+  return <Box flexDirection="column" width={width} height={height - 1} overflow="hidden">
+    <Text bold color="cyan" wrap="truncate-end">CVP CLI · {input.busy() ? '작업 중' : '입력 가능'} · 전송 대기 {input.queue.length}개</Text>
     <Box flexGrow={1} flexDirection={side ? 'row' : 'column'}>
       <Box flexDirection="column" flexGrow={1} flexShrink={0} width={side ? width - 42 : width} height={side || !input.panelVisible ? height - 3 : height - 8}>
         <Box flexGrow={1} flexShrink={1} minHeight={1} overflow="hidden"><Text wrap="wrap">{visible}</Text></Box>
@@ -144,13 +160,32 @@ function Screen({ input }: { input: InteractiveInput }) {
       </Box>
       {input.panelVisible && <Box width={side ? 42 : width} height={side ? undefined : 5} borderStyle="round" borderColor={input.statusFocused ? "cyan" : "gray"} flexDirection="column" flexShrink={0} overflow="hidden"><Text bold>상태 · Tab/PgUp/PgDn 이동</Text><Text wrap="wrap">{wrapAnsi(input.status().map(clean).join('\n'), side ? 40 : Math.max(1, width - 2), { hard: true }).split('\n').slice(input.statusScroll).join('\n')}</Text></Box>}
     </Box>
-    <Text dimColor>Enter {input.enterAction} · Ctrl+Enter {input.ctrlEnterAction} · Shift+Enter {input.shiftEnterAction} · PgUp/PgDn 기록</Text>
+    <Text dimColor wrap="truncate-end">Enter {input.enterAction} · Ctrl+Enter {input.ctrlEnterAction} · Shift+Enter {input.shiftEnterAction}{input.interruptKey ? ` · ${input.interruptKey} interrupt` : ''} · 휠/PgUp/PgDn 기록 · Shift+드래그 선택</Text>
   </Box>;
 }
 
 export function startInteractiveUi(input: InteractiveInput) {
-  const stdin = new InkInput(process.stdin);
-  const instance = render(<Screen input={input} />, { stdin, exitOnCtrlC: false, patchConsole: false, interactive: true, maxFps: 20, kittyKeyboard: { mode: 'auto' } });
-  const end = () => input.close(); process.stdin.on('end', end);
-  return () => { process.stdin.off('end', end); input.close(); instance.unmount(); stdin.dispose(); };
+  const stdin = new InkInput(process.stdin, rows => input.scrollTranscript(rows));
+  const isWindowsTerminal = process.platform === 'win32' && Boolean(process.env.WT_SESSION);
+  const instance = render(<Screen input={input} />, {
+    stdin,
+    exitOnCtrlC: false,
+    patchConsole: false,
+    interactive: true,
+    maxFps: 20,
+    kittyKeyboard: { mode: isWindowsTerminal ? 'enabled' : 'auto' },
+  });
+  process.stdout.write('\x1b[?1006h\x1b[?1000h');
+  const end = () => input.close();
+  process.stdin.on('end', end);
+  return () => {
+    process.stdin.off('end', end);
+    input.close();
+    try {
+      process.stdout.write('\x1b[?1000l\x1b[?1006l');
+      instance.unmount();
+    } finally {
+      stdin.dispose();
+    }
+  };
 }

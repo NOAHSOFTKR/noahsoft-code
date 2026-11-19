@@ -37,7 +37,7 @@ ${chalk.bold('사용법')}
   cvp profile list | show <name> | delete <name>
   cvp profile run <name>            저장 설정으로 실행 (명령행 옵션으로 덮어쓰기)
   cvp mcp add|list|remove|header-env 외부 MCP 서버 관리
-  cvp config set <key> <value>     설정 저장 (effort, model, maxSessionCostUsd, permissionMode, sandbox, additionalDirectories, expectedOrgId, enterAction, ctrlEnterAction, shiftEnterAction, slashEnterSubmit)
+  cvp config set <key> <value>     설정 저장 (effort, model, maxSessionCostUsd, permissionMode, sandbox, additionalDirectories, expectedOrgId, enterAction, ctrlEnterAction, shiftEnterAction, slashEnterSubmit, interruptKey)
   cvp config get [key] | unset <key> | path
 
 ${chalk.bold('옵션')}

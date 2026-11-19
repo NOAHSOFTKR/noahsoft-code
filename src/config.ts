@@ -24,7 +24,16 @@ export function agentConfigDir(): string {
 
 export type InputAction = 'newline' | 'queue' | 'interrupt';
 
+export type InterruptKey = 'ctrl+g' | 'ctrl+k' | 'ctrl+u';
+
+function parseInterruptKey(value: unknown): InterruptKey {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (normalized === 'ctrl+g' || normalized === 'ctrl+k' || normalized === 'ctrl+u') return normalized;
+  throw new Error('interruptKey에는 ctrl+g, ctrl+k, ctrl+u 중 하나가 필요합니다.');
+}
+
 export interface FileConfig {
+  interruptKey?: InterruptKey;
   enterAction?: InputAction;
   ctrlEnterAction?: InputAction;
   shiftEnterAction?: InputAction;
@@ -44,7 +53,8 @@ export interface FileConfig {
   permissionMode?: string;
 }
 
-const CONFIG_KEYS: Record<string, 'string' | 'number' | 'boolean' | 'list' | 'mode' | 'effort' | 'inputAction'> = {
+const CONFIG_KEYS: Record<string, 'string' | 'number' | 'boolean' | 'list' | 'mode' | 'effort' | 'inputAction' | 'interruptKey'> = {
+  interruptKey: 'interruptKey',
   enterAction: 'inputAction',
   ctrlEnterAction: 'inputAction',
   shiftEnterAction: 'inputAction',
@@ -99,6 +109,9 @@ export function setConfigValue(rawKey: string, rawValue: string): { key: string;
       if (!['true', 'false'].includes(rawValue)) throw new Error(`${key}에는 true 또는 false가 필요합니다.`);
       value = rawValue === 'true';
       break;
+    case 'interruptKey':
+      value = parseInterruptKey(rawValue);
+      break;
     case 'inputAction':
       value = parseInputAction(rawValue);
       break;
@@ -146,6 +159,7 @@ export function loadDotEnv(cwd: string): string | undefined {
 }
 
 export interface ResolvedConfig {
+  interruptKey?: InterruptKey;
   enterAction: InputAction;
   ctrlEnterAction: InputAction;
   shiftEnterAction: InputAction;
@@ -220,6 +234,7 @@ export function resolveConfig(flags: { supervised?: boolean; subagentTools?: boo
     throw new Error('slashEnterSubmit에는 true 또는 false가 필요합니다.');
   }
   return {
+    interruptKey: file.interruptKey === undefined ? undefined : parseInterruptKey(file.interruptKey),
     enterAction, ctrlEnterAction, shiftEnterAction, slashEnterSubmit: file.slashEnterSubmit ?? true,
     model,
     modelSource,
