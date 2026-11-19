@@ -7,6 +7,7 @@ import { TodoList, todoServer } from './todos.js';
 import { AgentTools } from './agent-tools.js';
 import { subagentDefinitions } from './subagents.js';
 import { buildAgentEnv } from './auth.js';
+import { loadMcpServers } from './mcp.js';
 import { CostTracker, type SdkModelUsage } from './cost.js';
 import { classifyAgentError } from './errors.js';
 import { enabledTools, makeCanUseTool, pathGuardHook, PathGuard, PermissionQueue, type Asker, type CvpPermissionMode, type PermissionState } from './permissions.js';
@@ -161,7 +162,13 @@ export class AgentSession {
       resume: o.resume,
       continue: o.continueLast && !o.resume ? true : undefined,
       tools: o.subagentTools ? enabledTools().filter((name) => name !== 'Agent') : enabledTools(),
-      ...(this.agentTools ? { mcpServers: { cvp_agents: this.agentTools.server(), cvp_progress: todoServer(this.todos,'main',(text)=>this.notice(text)) } } : {}),
+      mcpServers: {
+        ...loadMcpServers(),
+        ...(this.agentTools ? {
+          cvp_agents: this.agentTools.server(),
+          cvp_progress: todoServer(this.todos, 'main', (text) => this.notice(text)),
+        } : {}),
+      },
       agents: o.subagentTools ? undefined : subagentDefinitions(o.effort),
       disallowedTools: ['Agent(fork)'],
       // 파일 시스템 설정(~/.claude/settings.json, 프로젝트 .claude/)을 읽지 않음: 권한 규칙·훅·apiKeyHelper 격리

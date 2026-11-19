@@ -175,6 +175,10 @@ export function describeToolInput(toolName: string, input: Record<string, unknow
  * 작업 디렉터리(및 허용 디렉터리) 밖의 파일 도구 호출을 거부한다.
  * 이것은 SDK 샌드박스(OS 수준 격리)와 다르다 — 셸 명령이 바깥 경로에 접근하는 것은 막지 못한다.
  */
+function isExternalMcpTool(name: string): boolean {
+  return name.startsWith('mcp__') && !name.startsWith('mcp__cvp_agents__') && !name.startsWith('mcp__cvp_progress__');
+}
+
 export function pathGuardHook(guard: PathGuard, state?: PermissionState): HookCallback {
   return async (input) => {
     if (input.hook_event_name !== 'PreToolUse') return { continue: true };
@@ -186,6 +190,10 @@ export function pathGuardHook(guard: PathGuard, state?: PermissionState): HookCa
       const updatedInput = delegationInput(toolInput);
       return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: updatedInput ? 'allow' : 'deny',
         permissionDecisionReason: 'CVP CLI: explorer/reviewer의 로컬 동기 실행만 허용됩니다.', ...(updatedInput ? { updatedInput } : {}) } };
+    }
+    if (isExternalMcpTool(input.tool_name)) {
+      if (state?.mode !== 'plan') return { continue: true };
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: PLAN_DENY } };
     }
     if (state?.mode === 'fullbypass') {
       return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: state.supervised ? 'allow' : 'deny', permissionDecisionReason: state.supervised ? 'CVP CLI: 감독하 fullbypass 자동 승인' : 'fullbypass 감독 확인이 필요합니다.' } };
@@ -269,7 +277,10 @@ export function makeCanUseTool(deps: CanUseToolDeps): CanUseTool {
       const updatedInput = delegationInput(input);
       return updatedInput ? { behavior: 'allow', updatedInput } : { behavior: 'deny', message: 'explorer/reviewer의 로컬 동기 실행만 허용됩니다.' };
     }
-    if (deps.state.mode === 'fullbypass') {
+    const externalMcp = isExternalMcpTool(toolName);
+    if (externalMcp && deps.state.mode === 'plan') return { behavior: 'deny', message: PLAN_DENY };
+    if (externalMcp && !deps.ask) return { behavior: 'deny', message: '외부 MCP 도구는 대화형 승인이 필요합니다.' };
+    if (!externalMcp && deps.state.mode === 'fullbypass') {
       return deps.state.supervised ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: 'fullbypass 감독 확인이 필요합니다.' };
     }
     const target = deps.guard.targetOf(toolName, input);
@@ -319,7 +330,7 @@ export function makeCanUseTool(deps: CanUseToolDeps): CanUseTool {
       const ans = (await deps.ask(chalk.bold(`  허용할까요? [y=허용 / n=거부${always}] `), opts.signal)).trim().toLowerCase();
       if (opts.signal.aborted) return { behavior: 'deny', message: '중단됨', interrupt: true };
       if (target && !deps.guard.allows(target)) return { behavior: 'deny', message: '승인 대기 중 경로가 변경되어 거부했습니다.' };
-      if ((isShell || isWrite) && deps.state.mode === 'plan') return { behavior: 'deny', message: PLAN_DENY };
+      if ((isShell || isWrite || externalMcp) && deps.state.mode === 'plan') return { behavior: 'deny', message: PLAN_DENY };
       if (ans === 'y' || ans === 'yes') return { behavior: 'allow', updatedInput: input };
       if (ans === 'a' && always) {
         if (isShell) deps.state.allowedCommands.add(command);

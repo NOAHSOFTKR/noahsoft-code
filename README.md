@@ -372,3 +372,25 @@ cvp가 실행 중인 동안 명령과 개별 서브에이전트를 백그라운�
 목록은 `CVP_HOME`(기본 `~/.cvp`)/todos/<session-id>.json에 저장하며 같은 세션 재개 시 복원합니다.
 완료 상태는 모델의 보고이며 자동 테스트나 외부 검증의 성공을 보장하지 않습니다.
 `-p --json` 결과에도 `runtime_status`, `todos`, `background_tasks`를 포함합니다.
+
+## 외부 MCP 서버
+
+서버는 사용자별 `CVP_HOME`(기본 `~/.cvp`)/mcp.json에 등록되며, 다음 CVP 세션에서 연결합니다.
+
+```powershell
+cvp mcp add docs http https://example.com/mcp
+cvp mcp add local stdio node C:\tools\mcp-server.mjs --read-only
+cvp mcp list
+cvp mcp remove local
+```
+
+`list`는 등록된 서버 이름과 전송 방식을 표시합니다. 외부 도구는 메인 세션에서만 사용하며, 각 호출에 대화형 승인이 필요합니다. `plan` 모드와 비대화형 실행(`-p`)에서는 호출을 거부합니다. STDIO 서버는 세션 시작 시 로컬 프로그램을 실행하므로 신뢰하는 명령만 등록하세요.
+
+인증이 필요한 HTTP 서버에는 헤더마다 환경변수 이름을 연결하세요. 아래 명령은 현재 셸에 `DOCS_MCP_TOKEN`이 설정되어 있고 값에 `Bearer ` 접두사가 포함되어 있다고 가정합니다.
+
+```powershell
+cvp mcp header-env docs Authorization DOCS_MCP_TOKEN
+cvp
+```
+
+다른 헤더를 추가하려면 같은 명령에 다른 헤더 이름을 지정하세요. 설정 파일에는 환경변수 이름만 저장하며, 값은 CVP 실행 시 읽습니다. 값이 없거나 올바른 HTTP 헤더 값이 아니면 오류를 표시합니다. 인증 헤더는 HTTPS와 로컬 테스트용 루프백 HTTP에서 사용할 수 있습니다.

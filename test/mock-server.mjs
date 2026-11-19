@@ -101,6 +101,9 @@ export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels 
           return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model, content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 12, output_tokens: 1 } }));
         }
         if (!isMain) return sse(res, [start, ...text('Mock title'), ...end('end_turn')]);
+        if (!hasToolResult && lastText.includes('RUN_HTTP_MCP') && toolNames.includes('mcp__remote__hello')) {
+          return sse(res, [start, ...tool('mcp__remote__hello', {}), ...end('tool_use')]);
+        }
         if (toolNames.includes('mcp__cvp_agents__spawn_agent') && JSON.stringify(json.messages).includes('COORDINATE_AGENTS')) {
           const previous = json.messages.flatMap((m) => Array.isArray(m.content) ? m.content : []).filter((c) => c.type === 'tool_use');
           const idMatch = lastText.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
