@@ -1,3 +1,4 @@
+import { PromptHistory } from './prompt-history.js';
 import { parseModelInput } from './model-input.js';
 import readline from 'node:readline';
 import { PassThrough } from 'node:stream';
@@ -24,6 +25,7 @@ export interface ReplContext {
 const HELP = `
 ${chalk.bold('내부 명령어')}
   /help              명령어 안내
+  /ui                작업 모드 전환 (대기열·초안·기록·모델)
   /model [id]        현재 모델 조회 / 모델 변경(실제 API 호출로 권한 검증 후 적용)
   /mode [모드]       권한 모드 조회 / 변경 (default | acceptEdits | plan | bypass | fullbypass)
   /models            조회 가능한 모델 목록(GET /v1/models)
@@ -53,7 +55,7 @@ function fmtUsd(n: number): string {
 export async function runRepl(ctx: ReplContext): Promise<void> {
   const { cfg } = ctx;
   let atMainPrompt = false;
-  const interactive = process.stdin.isTTY && process.stdout.isTTY ? new InteractiveInput() : undefined;
+  const interactive = process.stdin.isTTY && process.stdout.isTTY ? new InteractiveInput(new PromptHistory(cfg.cwd)) : undefined;
   let disposeUi: (() => void) | undefined;
   const write = (text: string) => { if (interactive) interactive.write(text); else process.stdout.write(text); };
   const input = interactive ? new PassThrough() : process.stdin;
@@ -170,6 +172,13 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
   rl.on('SIGINT', onSigint);
   if (interactive) {
     interactive.modelIds = [ctx.model];
+    interactive.currentModel = () => session.activeModel;
+    interactive.loadModelIds = async () => (await listModels(apiClient(ctx.apiKey))).map(item => item.id);
+    interactive.summaryStatus = () => [
+      `남은 예산: ${fmtUsd(tracker.remainingUsd)}${tracker.ledger.usageIncomplete ? ' (추정)' : ''}`,
+      `권한: ${permState.mode}`,
+      `작업: ${session.busy ? '진행 중' : '대기'} · BG ${session.listTasks().filter(task => task.status === 'running').length}`,
+    ];
     interactive.onInterrupt = onSigint;
     interactive.enterAction = cfg.enterAction;
     interactive.ctrlEnterAction = cfg.ctrlEnterAction;
@@ -414,7 +423,10 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
       }
       await session.setModel(id);
       model = id;
-      if (interactive && !interactive.modelIds.includes(id)) interactive.modelIds.push(id);
+      if (interactive) {
+        if (!interactive.modelIds.includes(id)) interactive.modelIds.push(id);
+        interactive.recentModels = [id, ...interactive.recentModels.filter(item => item !== id)].slice(0, 10);
+      }
       write(ui.ok(`✔ 모델을 ${id} 로 변경했습니다. (영구 저장: cvp config set model ${id})\n`));
     },
   };

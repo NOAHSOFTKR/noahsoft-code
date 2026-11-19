@@ -94,3 +94,64 @@ test('arrows move across width-wrapped rows without changing submitted text', as
  assert.equal(ui.draft, 'abcdef!ghij');
  ui.close();
 });
+
+test('workspace recalls the right queued prompt and stashes the current draft', async () => {
+ const ui = new InteractiveInput();
+ ui.insert('first'); ui.submit();
+ ui.insert('second'); ui.submit();
+ ui.insert('/ui'); ui.submit();
+ assert.equal(ui.enhanced, true);
+ ui.key('', {escape:true});
+ ui.insert('work in progress');
+ ui.openWorkspace();
+ ui.key('', enter);
+ assert.deepEqual(ui.workspaceEntries(), ['first', 'second']);
+ assert.equal(await ui.readLine('> '), 'first');
+ ui.key('', enter);
+ assert.deepEqual(ui.workspaceEntries(), ['second']);
+ assert.deepEqual(ui.queue, ['second']);
+ ui.key('', enter);
+ assert.equal(ui.draft, 'second');
+ assert.deepEqual(ui.queue, []);
+ ui.openWorkspace();
+ for (let i = 0; i < 3; i++) ui.key('', {downArrow:true});
+ ui.key('', enter);
+ assert.equal(ui.draft, 'work in progress');
+ ui.close();
+});
+
+test('workspace model picker preserves drafts and pauses for approvals', async () => {
+ const ui = new InteractiveInput();
+ ui.currentModel = () => 'claude-current';
+ ui.modelIds = ['claude-other'];
+ ui.insert('/ui'); ui.submit();
+ ui.key('', {escape:true});
+ ui.insert('draft');
+ ui.openWorkspace('models');
+ const answer = ui.ask('allow?');
+ ui.key('', {downArrow:true});
+ ui.insert('n'); ui.key('', enter);
+ assert.equal(await answer, 'n');
+ assert.equal(ui.workspace.index, 0);
+ ui.key('', {downArrow:true});
+ ui.key('', enter);
+ assert.equal(ui.draft, 'draft');
+ assert.equal(await ui.readLine('> '), '/model claude-other');
+ ui.close();
+});
+
+test('workspace history search restores a prompt for editing without submitting it', () => {
+ const ui = new InteractiveInput();
+ ui.insert('find the logger'); ui.submit();
+ ui.insert('check tests'); ui.submit();
+ ui.insert('/ui'); ui.submit();
+ ui.key('', {escape:true});
+ ui.insert('keep this draft');
+ ui.key('r', {ctrl:true});
+ ui.insert('LOGGER');
+ assert.deepEqual(ui.workspaceEntries(), ['find the logger']);
+ ui.key('', enter);
+ assert.equal(ui.draft, 'find the logger');
+ assert.deepEqual(ui.queue, ['find the logger', 'check tests']);
+ ui.close();
+});
