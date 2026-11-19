@@ -29,6 +29,7 @@ export interface SessionLedger {
   byModel: Record<string, ModelTotals>;
   requests: RequestUsage[];
   updatedAt: string;
+  usageIncomplete?: boolean;
   delegated?: { costUsd: number; byModel: Record<string, ModelTotals> };
 }
 

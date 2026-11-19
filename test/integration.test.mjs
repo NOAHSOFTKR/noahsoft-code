@@ -356,7 +356,7 @@ test('개별 에이전트 MCP 툴: spawn/wait/send/resume와 합산 비용', asy
   assert.equal(output.result, 'COORDINATION_DONE');
   const calls = mock.log.slice(before).filter((x) => x.path === '/v1/messages' && x.body?.tools?.length);
   const parent = calls.filter((x) => x.body.tools.some((t) => t.name === 'mcp__cvp_agents__spawn_agent'));
-  const child = calls.filter((x) => !x.body.tools.some((t) => t.name.startsWith('mcp__') || t.name === 'Agent'));
+  const child = calls.filter((x) => !x.body.tools.some((t) => t.name.startsWith('mcp__cvp_agents__') || t.name === 'Agent'));
   assert.ok(parent.length >= 5);
   assert.ok(child.length >= 2);
   assert.ok(child.some((x) => JSON.stringify(x.body.messages).includes('BANANA') && JSON.stringify(x.body.messages).includes('RECALL')), 'follow-up resumes original conversation');
@@ -365,4 +365,24 @@ test('개별 에이전트 MCP 툴: spawn/wait/send/resume와 합산 비용', asy
   assert.ok(ledger.delegated.costUsd > 0);
   assert.equal(output.session_cost_usd, ledger.costUsd);
   assert.ok(output.session_cost_usd >= ledger.delegated.costUsd);
+  assert.equal(output.remaining_budget_usd,Math.max(0,1-output.session_cost_usd));
+  assert.equal(output.usage_complete,true);
+  assert.ok(parent.some((c)=>JSON.stringify(c.body.messages).includes('remaining_budget_usd')));
+});
+
+
+test('fullbypass: 실행별 감독 확인과 위험명령 자동 승인, config 복구', async () => {
+  const ws=tempWorkspace();const env=mockEnv(mock.url,ws.home);
+  const before=mock.log.length;
+  const denied=await runCli(['--permission-mode','fullbypass','-p','DANGEROUS_COMMAND'],{cwd:ws.work,env});
+  assert.notEqual(denied.code,0);assert.match(denied.stderr,/supervised/);
+  assert.equal(mock.log.length,before,'감독 확인 전 API 호출 없음');
+  const allowed=await runCli(['--permission-mode','fullbypass','--supervised','-p','DANGEROUS_COMMAND'],{cwd:ws.work,env});
+  assert.equal(allowed.code,0,allowed.stderr);assert.ok(!allowed.stdout.includes('tool_result:error'),allowed.stdout);
+  assert.equal((await runCli(['config','set','permissionMode','fullbypass'],{cwd:ws.work,env})).code,0);
+  assert.equal((await runCli(['config','unset','permissionMode'],{cwd:ws.work,env})).code,0);
+  const cancelled=await runCli([],{cwd:ws.work,env,stdin:'/mode fullbypass\nno\n/status\n/exit\n'});
+  assert.match(cancelled.stdout,/취소했습니다/);assert.match(cancelled.stdout,/권한 모드\s+: default/);
+  const confirmed=await runCli([],{cwd:ws.work,env,stdin:'/mode fullbypass\nSUPERVISED\n/status\n/exit\n'});
+  assert.match(confirmed.stdout,/권한 모드\s+: fullbypass/);
 });

@@ -20,7 +20,7 @@ function textOf(content) {
     .join('\n');
 }
 
-export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels = [], status = {} } = {}) {
+export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels = [], status = {}, cacheReadTokens = 0, cacheWriteTokens = 0 } = {}) {
   const log = [];
   let n = 0;
   const server = http.createServer((req, res) => {
@@ -76,7 +76,7 @@ export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels 
         // Agent 런타임의 부가 요청(제목 생성 등)은 tools 가 없음 → 짧은 텍스트
         const isMain = Array.isArray(json.tools) && json.tools.length > 0;
         const id = `msg_mock_${++n}`;
-        const usage = { input_tokens: isMain ? inputTokens : 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+        const usage = { input_tokens: isMain ? inputTokens : 10, output_tokens: 1, cache_read_input_tokens: isMain ? cacheReadTokens : 0, cache_creation_input_tokens: isMain ? cacheWriteTokens : 0 };
         const start = ['message_start', { message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage } }];
         const text = (t) => [
           ['content_block_start', { index: 0, content_block: { type: 'text', text: '' } }],
@@ -116,6 +116,14 @@ export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels 
           }
           return sse(res,[start,...tool(name,args),...end('tool_use')]);
         }
+        if(toolNames.includes('mcp__cvp_progress__update_todos')&&JSON.stringify(json.messages).includes('TODO_UPDATE')){
+          const previous=json.messages.flatMap(m=>Array.isArray(m.content)?m.content:[]).filter(c=>c.type==='tool_use'&&c.name==='mcp__cvp_progress__update_todos');
+          if(previous.length<2)return sse(res,[start,...tool('mcp__cvp_progress__update_todos',{todos:[{content:'Inspect sample',activeForm:'Inspecting sample',status:previous.length?'completed':'in_progress'},{content:'Report results',activeForm:'Reporting results',status:previous.length?'completed':'pending'}]}),...end('tool_use')]);
+        }
+        if(toolNames.includes('mcp__cvp_agents__spawn_agent')&&lastText.includes('RUN_BACKGROUND_AGENT'))return sse(res,[start,...tool('mcp__cvp_agents__spawn_agent',{role:'explorer',message:lastText.includes('WRITE')?'DELAY_WRITE':'SLOW',background:true}),...end('tool_use')]);
+        if(lastText.includes('RUN_BACKGROUND_POWERSHELL'))return sse(res,[start,...tool('Bash',{command:'powershell.exe -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 2; Write-Output background-ready"',run_in_background:true,description:'Local Windows background test'}),...end('tool_use')]);
+        if(lastText.includes('RUN_BACKGROUND_LONG'))return sse(res,[start,...tool('Bash',{command:'sleep 30; echo long-ready',run_in_background:true,description:'Local long background test'}),...end('tool_use')]);
+        if(lastText.includes('RUN_BACKGROUND'))return sse(res,[start,...tool('Bash',{command:'sleep 2; echo background-ready',run_in_background:true,description:'Local background test'}),...end('tool_use')]);
         if (hasToolResult) {
           return sse(res, [start, ...text(`도구 결과 수신: ${lastText.slice(0, 200)}\n`), ...end('end_turn')]);
         }
@@ -131,6 +139,10 @@ export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels 
         }
         if (lastText.includes('RUN_POWERSHELL') && toolNames.includes('PowerShell')) {
           return sse(res, [start, ...tool('PowerShell', { command: 'Write-Output hello-ps' }), ...end('tool_use')]);
+        }
+        if(lastText.includes('DELAY_WRITE')){
+          setTimeout(()=>{if(!res.destroyed)sse(res,[start,...tool('Write',{file_path:`${cwd}/cvp-out.txt`,content:'written by background'}),...end('tool_use')]);},1000);
+          return;
         }
         if (lastText.includes('DANGEROUS_COMMAND')) {
           return sse(res, [start, ...tool('Bash', { command: 'echo rm -rf example' }), ...end('tool_use')]);
@@ -152,6 +164,7 @@ export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels 
           const all = json.messages.map((m) => textOf(m.content)).join(' | ');
           return sse(res, [start, ...text(`기억: ${all.includes('BANANA') ? 'BANANA 발견' : '없음'}\n`), ...end('end_turn')]);
         }
+        if (lastText.includes('PRIORITY_NOW') || lastText.includes('QUEUED_NEXT')) return sse(res, [start, ...text('follow-up complete\n'), ...end('end_turn')]);
         if (lastText.includes('SLOW')) {
           // 중단 테스트용: 천천히 스트리밍
           res.writeHead(200, { 'content-type': 'text/event-stream' });

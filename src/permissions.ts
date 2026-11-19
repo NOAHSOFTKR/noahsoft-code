@@ -6,7 +6,7 @@ import type { CanUseTool, HookCallback, PermissionResult } from '@anthropic-ai/c
 
 /** 이 CLI가 모델에 노출하는 SDK 내장 도구 */
 export function enabledTools(platform = process.platform): string[] {
-  const tools = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'Agent'];
+  const tools = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'Agent', 'TaskStop'];
   // Windows에서는 SDK의 PowerShell 도구도 함께 제공(Bash 도구는 Git Bash 필요)
   if (platform === 'win32') tools.push('PowerShell');
   return tools;
@@ -92,9 +92,10 @@ export type Asker = (question: string, signal?: AbortSignal) => Promise<string>;
  * - acceptEdits : 작업 디렉터리 안 파일 수정은 자동 승인, 명령 실행은 승인 요청
  * - plan        : 읽기 전용. 파일 수정·명령 실행 거부(계획만 세움)
  * - bypass      : 작업 디렉터리 안 수정·명령 자동 승인. 위험 명령은 여전히 승인 요청(비대화형이면 거부)
- * 모든 모드에서 작업 디렉터리 밖 파일 도구 접근은 거부된다.
+ * - fullbypass  : 24시간 감독 확인 시 위험 명령·외부 파일 도구 접근까지 자동 승인
+ * fullbypass 외 모드에서 작업 디렉터리 밖 파일 도구 접근은 거부된다.
  */
-export const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'bypass'] as const;
+export const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'bypass', 'fullbypass'] as const;
 export type CvpPermissionMode = (typeof PERMISSION_MODES)[number];
 
 /** Shift+Tab 순환 대상(bypass 는 실수로 켜지지 않도록 제외) */
@@ -113,6 +114,8 @@ const MODE_ALIASES: Record<string, CvpPermissionMode> = {
   bypass: 'bypass',
   bypasspermissions: 'bypass',
   yolo: 'bypass',
+  fullbypass: 'fullbypass',
+  'full-bypass': 'fullbypass',
 };
 
 export function parsePermissionMode(v: string): CvpPermissionMode {
@@ -125,17 +128,20 @@ export const MODE_INFO: Record<CvpPermissionMode, { label: string; desc: string 
   default: { label: '기본', desc: '파일 수정·명령 실행 모두 승인 요청' },
   acceptEdits: { label: '편집 자동승인', desc: '작업 디렉터리 안 파일 수정 자동 승인, 명령 실행은 승인 요청' },
   plan: { label: '계획(읽기 전용)', desc: '파일 수정·명령 실행 거부, 읽기와 계획만' },
+  fullbypass: { label: '감독하 완전 자동승인', desc: '24시간 감독 확인: 위험 명령·외부 파일을 포함한 도구 승인 자동 수락' },
   bypass: { label: '전체 자동승인', desc: '작업 디렉터리 안 수정·명령 자동 승인(위험 명령은 승인 요청)' },
 };
 
 export interface PermissionState {
   mode: CvpPermissionMode;
+  supervised?: boolean;
   /** 세션 동안 승인된 Bash/PowerShell 명령(정확히 일치) */
   allowedCommands: Set<string>;
 }
 
-export function newPermissionState(mode: CvpPermissionMode = 'default'): PermissionState {
-  return { mode, allowedCommands: new Set() };
+export function newPermissionState(mode: CvpPermissionMode = 'default', supervised = false): PermissionState {
+  if (mode === 'fullbypass' && !supervised) throw new Error('fullbypass는 24시간 감독 확인(--supervised)이 필요합니다.');
+  return { mode, supervised, allowedCommands: new Set() };
 }
 
 const PLAN_DENY =
@@ -181,6 +187,9 @@ export function pathGuardHook(guard: PathGuard, state?: PermissionState): HookCa
       return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: updatedInput ? 'allow' : 'deny',
         permissionDecisionReason: 'CVP CLI: explorer/reviewer의 로컬 동기 실행만 허용됩니다.', ...(updatedInput ? { updatedInput } : {}) } };
     }
+    if (state?.mode === 'fullbypass') {
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: state.supervised ? 'allow' : 'deny', permissionDecisionReason: state.supervised ? 'CVP CLI: 감독하 fullbypass 자동 승인' : 'fullbypass 감독 확인이 필요합니다.' } };
+    }
     const target = guard.targetOf(input.tool_name, toolInput);
     if (target && !guard.allows(target, input.cwd)) {
       return {
@@ -210,7 +219,7 @@ export function pathGuardHook(guard: PathGuard, state?: PermissionState): HookCa
   };
 }
 
-const MODE_RANK: Record<CvpPermissionMode, number> = { plan: 0, default: 1, acceptEdits: 2, bypass: 3 };
+const MODE_RANK: Record<CvpPermissionMode, number> = { plan: 0, default: 1, acceptEdits: 2, bypass: 3, fullbypass: 4 };
 
 export function childPermissionState(parent: PermissionState, requested?: CvpPermissionMode): PermissionState {
   if (requested && MODE_RANK[requested] > MODE_RANK[parent.mode]) {
@@ -219,6 +228,7 @@ export function childPermissionState(parent: PermissionState, requested?: CvpPer
   return {
     get mode() { return requested && MODE_RANK[requested] < MODE_RANK[parent.mode] ? requested : parent.mode; },
     set mode(_mode: CvpPermissionMode) { /* child cannot raise its assigned ceiling */ },
+    get supervised() { return parent.supervised; },
     allowedCommands: new Set<string>(),
   };
 }
@@ -253,9 +263,14 @@ export function makeCanUseTool(deps: CanUseToolDeps): CanUseTool {
   const queue = deps.queue ?? new PermissionQueue();
   return (toolName, input, opts): Promise<PermissionResult> => queue.run(async () => {
     if (opts.signal.aborted) return { behavior: 'deny', message: '중단됨', interrupt: true };
+    if (['TaskStop','mcp__cvp_progress__update_todos','mcp__cvp_progress__get_todos','mcp__cvp_agents__spawn_agent','mcp__cvp_agents__send_message','mcp__cvp_agents__wait_agent','mcp__cvp_agents__list_tasks','mcp__cvp_agents__task_status','mcp__cvp_agents__stop_task'].includes(toolName)) return { behavior: 'allow', updatedInput: input };
+
     if (toolName === 'Agent' || toolName === 'Task') {
       const updatedInput = delegationInput(input);
       return updatedInput ? { behavior: 'allow', updatedInput } : { behavior: 'deny', message: 'explorer/reviewer의 로컬 동기 실행만 허용됩니다.' };
+    }
+    if (deps.state.mode === 'fullbypass') {
+      return deps.state.supervised ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: 'fullbypass 감독 확인이 필요합니다.' };
     }
     const target = deps.guard.targetOf(toolName, input);
     if (target && !deps.guard.allows(target)) {

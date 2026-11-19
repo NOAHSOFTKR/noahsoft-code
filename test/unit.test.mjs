@@ -372,3 +372,44 @@ test('부모·자식 승인 직렬화 및 대기 중 권한 하향·취소', asy
   assert.equal((await second).behavior,'deny');
   assert.equal(asks,1);
 });
+
+
+test('fullbypass: 감독 확인·모든 승인·구조 제한·부모 상한', async () => {
+  const { pathGuardHook, childPermissionState, parsePermissionMode, CYCLE_MODES } = await import('../dist/permissions.js');
+  assert.equal(parsePermissionMode('full-bypass'),'fullbypass');
+  assert.ok(!CYCLE_MODES.includes('fullbypass'));
+  assert.throws(()=>newPermissionState('fullbypass'), /감독/);
+  const state=newPermissionState('fullbypass',true);
+  const guard=new PathGuard(tmpHome);
+  const check=makeCanUseTool({guard,state,write:()=>{}});
+  const opts={signal:new AbortController().signal};
+  const outside=path.join(tmpHome,'..','full-outside.txt');
+  assert.equal((await check('Write',{file_path:outside,content:'x'},opts)).behavior,'allow');
+  assert.equal((await check('Bash',{command:'echo rm -rf example'},opts)).behavior,'allow');
+  assert.equal((await check('Agent',{subagent_type:'fork'},opts)).behavior,'deny');
+  const hook=pathGuardHook(guard,state);
+  const event={hook_event_name:'PreToolUse',tool_name:'Write',tool_input:{file_path:outside},cwd:tmpHome};
+  assert.equal((await hook(event)).hookSpecificOutput.permissionDecision,'allow');
+  assert.equal((await hook({...event,agent_id:'child',tool_name:'Agent'})).hookSpecificOutput.permissionDecision,'deny');
+  state.supervised=false;
+  assert.equal((await check('Write',{file_path:outside},opts)).behavior,'deny');
+  assert.equal((await hook(event)).hookSpecificOutput.permissionDecision,'deny');
+  state.supervised=true;
+  const inherited=childPermissionState(state);
+  const restricted=childPermissionState(state,'bypass');
+  assert.equal(inherited.mode,'fullbypass');assert.equal(inherited.supervised,true);
+  assert.equal(restricted.mode,'bypass');
+  state.mode='plan';assert.equal(inherited.mode,'plan');
+  assert.throws(()=>childPermissionState(newPermissionState('bypass'),'fullbypass'), /부모 권한/);
+});
+
+
+test('부모 예산은 서브에이전트 툴 사용 시에도 전체 잔여액 사용', async () => {
+  const { AgentSession } = await import('../dist/agent.js');
+  const tracker=new CostTracker(undefined,2);
+  tracker.ledger.costUsd=0.25;
+  const session=new AgentSession({apiKey:'test',model:'test',subagentTools:true,cwd:tmpHome,tracker,guard:new PathGuard(tmpHome),
+    permState:newPermissionState(),sandbox:false,raw:true});
+  try {assert.equal(session.buildOptions().maxBudgetUsd,1.75);}
+  finally {await session.close();}
+});

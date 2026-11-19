@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { loadProfile, saveProfile, listProfiles, deleteProfile, type ExecutionProfile } from './profiles.js';
 import { parseArgs } from 'node:util';
 import chalk from 'chalk';
 import { listSessions } from '@anthropic-ai/claude-agent-sdk';
@@ -19,7 +20,6 @@ import { BudgetExceededError, CostTracker, loadLedger } from './cost.js';
 import { apiClient, checkKeyOnline, listModels, probeModel, retrieveModel } from './models.js';
 import { newPermissionState, PathGuard } from './permissions.js';
 import { ui } from './render.js';
-import { runRepl } from './repl.js';
 
 const VERSION = '0.1.0';
 
@@ -32,17 +32,21 @@ ${chalk.bold('사용법')}
   cvp models [--verify]            조회 가능한 모델 목록 (--verify: 실제 호출로 권한 검증)
   cvp verify [model-id]            API 키·조직·모델 접근 검증
   cvp sessions                     저장된 세션 목록
-  cvp config set <key> <value>     설정 저장 (effort, model, maxSessionCostUsd, permissionMode, sandbox, additionalDirectories, expectedOrgId)
+  cvp profile save <name>           현재 실행 설정 저장 (같은 이름은 갱신)
+  cvp profile list | show <name> | delete <name>
+  cvp profile run <name>            저장 설정으로 실행 (명령행 옵션으로 덮어쓰기)
+  cvp config set <key> <value>     설정 저장 (effort, model, maxSessionCostUsd, permissionMode, sandbox, additionalDirectories, expectedOrgId, enterAction, ctrlEnterAction, shiftEnterAction, slashEnterSubmit)
   cvp config get [key] | unset <key> | path
 
 ${chalk.bold('옵션')}
   -m, --model <id>       사용할 모델 (CVP_MODEL / config 보다 우선)
-      --subagent-tools  spawn_agent/send_message/wait_agent 제공 (예산: 부모 50%, 자식 50%)
+      --subagent-tools  spawn_agent/send_message/wait_agent 제공 (결과에 남은 세션 예산 표시)
       --effort <level>  추론 노력: low | medium | high | xhigh | max (CVP_EFFORT / config 보다 우선)
   -r, --resume <id>      세션 재개
   -c, --continue         이 디렉터리의 가장 최근 세션 이어가기
   -b, --budget <usd>     세션 예상 비용 한도 (CVP_MAX_SESSION_COST_USD 보다 우선)
-      --permission-mode <m> 권한 모드: default | acceptEdits | plan | bypass (CVP_PERMISSION_MODE)
+      --permission-mode <m> 권한 모드: default | acceptEdits | plan | bypass | fullbypass (CVP_PERMISSION_MODE)
+      --supervised      fullbypass 실행 시 24시간 감독 중임을 명시적으로 확인
       --cwd <dir>        작업 디렉터리
       --raw              Markdown 렌더링 없이 원문 스트리밍
       --json             (-p) 결과를 JSON 으로 출력
@@ -237,7 +241,7 @@ async function cmdPrint(prompt: string, cfg: ResolvedConfig, opts: { resume?: st
     continueLast: opts.continueLast,
     tracker,
     guard: new PathGuard(cfg.cwd, cfg.additionalDirectories),
-    permState: newPermissionState(cfg.permissionMode),
+    permState: newPermissionState(cfg.permissionMode, cfg.supervised),
     ask,
     sandbox: cfg.sandbox,
     raw: opts.raw || !process.stdout.isTTY,
@@ -249,7 +253,10 @@ async function cmdPrint(prompt: string, cfg: ResolvedConfig, opts: { resume?: st
   rl?.on('SIGINT', onSig);
   let code = 0;
   try {
+    const costBefore=tracker.sessionCost;
     const o = await session.send(prompt);
+    await session.close();
+    const finalTurnCost=tracker.sessionCost-costBefore;
     if (opts.json) {
       process.stdout.write(
         JSON.stringify(
@@ -258,9 +265,14 @@ async function cmdPrint(prompt: string, cfg: ResolvedConfig, opts: { resume?: st
             model: session.activeModel,
             result: o.result?.subtype === 'success' ? o.result.result : undefined,
             error: o.error,
-            turn_cost_usd: o.turnCostUsd,
+            turn_cost_usd: finalTurnCost,
             session_cost_usd: tracker.sessionCost,
+            remaining_budget_usd: tracker.remainingUsd,
+            usage_complete: !tracker.ledger.usageIncomplete,
             usage: tracker.ledger.byModel,
+            runtime_status: session.runtimeStatus.snapshot(),
+            todos: session.todos.snapshot(),
+            background_tasks: session.listTasks(),
           },
           null,
           2,
@@ -269,7 +281,7 @@ async function cmdPrint(prompt: string, cfg: ResolvedConfig, opts: { resume?: st
     } else {
       if (o.error) process.stderr.write(ui.err(`\n✖ ${o.error}\n`));
       process.stderr.write(
-        ui.dim(`\n─ 예상 비용 $${o.turnCostUsd.toFixed(5)} · 세션 ${session.sessionId ?? '-'} (cvp --resume 로 이어가기)\n`),
+        ui.dim(`\n─ 예상 비용 $${finalTurnCost.toFixed(5)} · 세션 ${session.sessionId ?? '-'} (cvp --resume 로 이어가기)\n${session.runtimeStatus.lines().join('\n')}\n`),
       );
     }
     if (o.error) code = o.result?.subtype === 'error_max_budget_usd' ? 6 : 1;
@@ -298,6 +310,7 @@ async function main(): Promise<void> {
       continue: { type: 'boolean', short: 'c' },
       budget: { type: 'string', short: 'b' },
       'permission-mode': { type: 'string' },
+      supervised: { type: 'boolean' },
       cwd: { type: 'string' },
       raw: { type: 'boolean' },
       json: { type: 'boolean' },
@@ -310,9 +323,17 @@ async function main(): Promise<void> {
   if (values.help) return void process.stdout.write(USAGE);
   if (values.version) return void process.stdout.write(`cvp ${VERSION}\n`);
 
-  if (values.cwd) {
-    if (!fs.existsSync(values.cwd)) fail(`작업 디렉터리가 없습니다: ${values.cwd}`);
-    process.chdir(values.cwd);
+  let profile: ExecutionProfile | undefined;
+  const runningProfile = positionals[0] === 'profile' && positionals[1] === 'run';
+  if (runningProfile) {
+    if (positionals.length !== 3) fail('사용법: cvp profile run <name>');
+    try { profile = loadProfile(positionals[2]); } catch (err) { fail((err as Error).message); }
+  }
+  const cwd = values.cwd ?? profile?.cwd;
+  if (cwd) {
+    try { if (!fs.statSync(cwd).isDirectory()) fail(`작업 디렉터리가 아닙니다: ${cwd}`); }
+    catch { fail(`작업 디렉터리가 없습니다: ${cwd}`); }
+    process.chdir(cwd);
   }
   loadDotEnv(process.cwd());
   // Agent SDK의 세션 함수(listSessions 등)가 CLI 전용 설정 디렉터리를 보도록 설정
@@ -324,14 +345,16 @@ async function main(): Promise<void> {
     budget = Number(values.budget);
     if (!Number.isFinite(budget) || budget < 0) fail(`--budget 값이 올바르지 않습니다: ${values.budget}`);
   }
+  // Allow repairing invalid input settings without first resolving them.
+  if (positionals[0] === 'config') return cmdConfig(positionals.slice(1));
   let cfg: ResolvedConfig;
   try {
-    cfg = resolveConfig({ subagentTools: values['subagent-tools'], model: values.model, effort: values.effort, budget, permissionMode: values['permission-mode'] });
+    cfg = resolveConfig({ supervised: values.supervised, subagentTools: values['subagent-tools'], model: values.model, effort: values.effort, budget, permissionMode: values['permission-mode'], cwd: process.cwd() }, profile);
   } catch (err) {
     fail((err as Error).message);
   }
 
-  const [cmd, ...rest] = positionals;
+  const [cmd, ...rest] = runningProfile ? [] : positionals;
   switch (cmd) {
     case 'models':
       return cmdModels(!!values.verify, !!values.yes, cfg);
@@ -339,13 +362,23 @@ async function main(): Promise<void> {
       return cmdVerify(rest[0], cfg);
     case 'sessions':
       return cmdSessions(cfg);
-    case 'config':
-      return cmdConfig(rest);
+    case 'profile': {
+      const [action, name, ...extra] = rest;
+      if (extra.length || (action !== 'list' && !name) || (action === 'list' && name)) fail('사용법: cvp profile save|show|delete|run <name> 또는 cvp profile list');
+      if (action === 'save') { saveProfile(name, cfg); process.stdout.write(ui.ok(`✔ 프로필 저장: ${name}\n`)); }
+      else if (action === 'show') process.stdout.write(JSON.stringify(loadProfile(name), null, 2) + '\n');
+      else if (action === 'list') process.stdout.write(listProfiles().join('\n') + '\n');
+      else if (action === 'delete') { deleteProfile(name); process.stdout.write(ui.ok(`✔ 프로필 삭제: ${name}\n`)); }
+      else fail('사용법: cvp profile save|show|delete|run <name> 또는 cvp profile list');
+      return;
+    }
     case undefined:
       break;
     default:
       if (values.print === undefined) fail(`알 수 없는 명령: ${cmd}\n${USAGE}`);
   }
+
+  if (cfg.permissionMode === 'fullbypass' && !cfg.supervised) fail('fullbypass는 24시간 감독 확인이 필요합니다. --supervised를 명시하세요.');
 
   if (values.print !== undefined) {
     let prompt = values.print;
@@ -356,6 +389,7 @@ async function main(): Promise<void> {
 
   const apiKey = requireKey();
   const model = requireModel(cfg);
+  const { runRepl } = await import('./repl.js');
   await runRepl({ apiKey, cfg, model, resume: values.resume, continueLast: values.continue, raw: !!values.raw });
   process.exit(0);
 }

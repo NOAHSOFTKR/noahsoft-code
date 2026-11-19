@@ -1,6 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import { query, type Options, type Query, type SDKMessage, type SDKUserMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import chalk from 'chalk';
-import { AgentTools, AGENT_TOOL_NAMES } from './agent-tools.js';
+import { RuntimeStatus } from './runtime-status.js';
+import { BackgroundTasks } from './background-tasks.js';
+import { TodoList, todoServer } from './todos.js';
+import { AgentTools } from './agent-tools.js';
 import { subagentDefinitions } from './subagents.js';
 import { buildAgentEnv } from './auth.js';
 import { CostTracker, type SdkModelUsage } from './cost.js';
@@ -52,6 +56,7 @@ export interface AgentSessionOptions {
   out?: (s: string) => void;
   /** 결과 출력 없이 조용히(-p --json) */
   quiet?: boolean;
+  onBackgroundUpdate?: () => void;
   onModeChange?: (mode: CvpPermissionMode) => void;
 }
 
@@ -107,10 +112,16 @@ export class AgentSession {
   private agentTools?: AgentTools;
   private permissionQueue = new PermissionQueue();
   private turnStartCost = 0;
+  readonly runtimeStatus = new RuntimeStatus();
+  readonly todos = new TodoList();
+  private backgroundTasks = new BackgroundTasks();
+  private turnStartedAt = 0;
+  private contextQueryUnavailable = false;
+  private nativeUsagePending = false;
   private input = new InputQueue();
-  private pending: { resolve: (o: TurnOutcome) => void } | undefined;
+  private pending: { id: string; resolve: (o: TurnOutcome) => void } | undefined;
   private loop: Promise<void> | undefined;
-  private spinner = new Spinner();
+  private spinner: Spinner;
   private md: MarkdownStream;
   private out: (s: string) => void;
   private toolNames = new Map<string, string>();
@@ -126,27 +137,31 @@ export class AgentSession {
 
   constructor(private o: AgentSessionOptions) {
     this.out = o.out ?? ((s) => process.stdout.write(s));
+    this.spinner = new Spinner(o.out ? { isTTY: false } as NodeJS.WriteStream : process.stdout);
     this.md = new MarkdownStream(this.out, o.raw);
     this.activeModel = o.model;
     this.sessionId = o.resume;
+    if(o.resume)this.todos.bind(o.resume);
   }
 
   private buildOptions(): Options {
     const { o } = this;
     const remaining = Math.max(0, o.tracker.limitUsd - o.tracker.sessionCost);
-    if (o.subagentTools) this.agentTools ??= new AgentTools({ apiKey: o.apiKey, cwd: o.cwd, guard: o.guard, model: () => this.activeModel, effort: o.effort, budgetUsd: remaining / 2, tracker: o.tracker,
+    this.agentTools ??= new AgentTools({ apiKey: o.apiKey, cwd: o.cwd, guard: o.guard, model: () => this.activeModel, effort: o.effort, tracker: o.tracker,
       permState: o.permState, queue: this.permissionQueue, ask: o.ask, sandbox: o.sandbox,
       beforePrompt: () => { this.spinner.stop(); this.md.flush(); }, write: this.out,
+      agentsEnabled: !!o.subagentTools, tasks: this.backgroundTasks, todos: this.todos,
+      notice: (text)=>this.notice(text),listTasks:()=>this.listTasks(),readTask:(id)=>this.taskStatus(id),stopTask:(id)=>this.stopTask(id),
     });
     return {
       model: o.model,
       effort: o.effort,
       cwd: o.cwd,
-      env: { ...buildAgentEnv(o.apiKey), ...(o.subagentTools ? { ENABLE_TOOL_SEARCH: 'false' } : {}) },
+      env: { ...buildAgentEnv(o.apiKey), ENABLE_TOOL_SEARCH: 'false' },
       resume: o.resume,
       continue: o.continueLast && !o.resume ? true : undefined,
       tools: o.subagentTools ? enabledTools().filter((name) => name !== 'Agent') : enabledTools(),
-      ...(this.agentTools ? { mcpServers: { cvp_agents: this.agentTools.server() }, allowedTools: AGENT_TOOL_NAMES } : {}),
+      ...(this.agentTools ? { mcpServers: { cvp_agents: this.agentTools.server(), cvp_progress: todoServer(this.todos,'main',(text)=>this.notice(text)) } } : {}),
       agents: o.subagentTools ? undefined : subagentDefinitions(o.effort),
       disallowedTools: ['Agent(fork)'],
       // 파일 시스템 설정(~/.claude/settings.json, 프로젝트 .claude/)을 읽지 않음: 권한 규칙·훅·apiKeyHelper 격리
@@ -168,13 +183,13 @@ export class AgentSession {
       additionalDirectories: o.guard.roots.slice(1),
       includePartialMessages: true,
       // SDK 자체 예산 한도(이번 query() 시작 이후 지출 기준) — CLI 사전 차단과 이중으로 적용
-      maxBudgetUsd: remaining > 0 ? remaining / (o.subagentTools ? 2 : 1) : 0.000001,
+      maxBudgetUsd: remaining > 0 ? remaining : 0.000001,
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
         append:
-          (o.subagentTools ? 'Use the cvp_agents spawn_agent, send_message, and wait_agent tools for delegation. Spawn returns an ID; wait for completion before using the result or sending follow-up work. Workers may edit and execute commands under their assigned permission_mode, which cannot exceed your current mode. They cannot delegate. Assign non-overlapping files to concurrent workers. ' : '') +
-          'You are running inside "CVP CLI", a terminal tool. Work only inside the current working directory unless the user explicitly asks otherwise. Answer in the user\'s language. Use explorer for code research and reviewer for independent review when useful or requested. Wait for their report before answering. Subagents must obey the assigned permission policy. Avoid concurrent edits to the same files.',
+          (o.subagentTools ? 'Use the cvp_agents spawn_agent, send_message, and wait_agent tools for delegation. Spawn returns an ID; wait for completion before using the result or sending follow-up work. Set background=true to keep an agent running after your turn; list_tasks, task_status, and stop_task manage tasks. Workers may edit and execute commands under their assigned permission_mode, which cannot exceed your current mode. They cannot delegate. Assign non-overlapping files to concurrent workers. ' : '') +
+          'You are running inside "CVP CLI", a terminal tool. Work only inside the current working directory unless the user explicitly asks otherwise. Answer in the user\'s language. Maintain an update_todos task list for multi-step work and update pending/in_progress/completed as you work so the user can see progress. Bash may run_in_background (on Windows it can invoke powershell.exe); use list_tasks/task_status/stop_task for session tasks. Use explorer for code research and reviewer for independent review when useful or requested. Wait for their report before answering. Subagents must obey the assigned permission policy. Avoid concurrent edits to the same files.',
       },
       sandbox: o.sandbox ? { enabled: true, failIfUnavailable: false } : undefined,
       stderr: process.env.CVP_DEBUG ? (d) => process.stderr.write(chalk.dim(d)) : undefined,
@@ -201,22 +216,26 @@ export class AgentSession {
   /** 프롬프트 전송 후 턴이 끝날 때까지 대기 */
   async send(text: string): Promise<TurnOutcome> {
     if (this.dead) throw new Error(`세션이 종료되었습니다: ${this.dead}`);
+    if(this.pending)throw new Error('현재 요청이 아직 실행 중입니다.');
     this.o.tracker.assertWithinBudget();
     if (!this.q) this.start();
     this.turnStartCost = this.o.tracker.sessionCost;
+    this.turnStartedAt = Date.now();
     this.busy = true;
     this.lastText = '';
-    const done = new Promise<TurnOutcome>((resolve) => (this.pending = { resolve }));
+    const id=randomUUID();
+    const done = new Promise<TurnOutcome>((resolve) => (this.pending = { id, resolve }));
     this.spinner.start('응답 대기 중… (Ctrl+C 중단)');
     // plan 모드에서는 모델이 실행 대신 계획을 세우도록 짧은 안내를 덧붙인다
     const content =
-      this.o.permState.mode === 'plan'
+      this.o.permState.mode === 'plan' && !/^\/compact(?:\s|$)/.test(text)
         ? `${text}
 
 [CVP CLI 안내: 현재 plan(읽기 전용) 모드입니다. 파일을 수정하거나 명령을 실행하지 말고, 필요한 파일을 읽은 뒤 구체적인 변경 계획을 제시하세요.]`
-        : text;
+        : this.o.permState.mode === 'fullbypass' && !/^\/compact(?:\s|$)/.test(text) ? `${text}\n\n[CVP CLI: fullbypass 모드, 사용자 감독 확인됨. 위험 명령·작업 폴더 밖 파일 도구 접근도 자동 승인됩니다. 인증·예산·도구 구성 제한은 유지됩니다.]` : text;
     this.input.push({
       type: 'user',
+      uuid: id,
       message: { role: 'user', content },
       parent_tool_use_id: null,
     } as SDKUserMessage);
@@ -230,7 +249,7 @@ export class AgentSession {
     this.out(ui.warn('\n⏹ 실행 중단 요청됨…\n'));
     this.interrupted = true;
     try {
-      await Promise.allSettled([this.q.interrupt(), this.agentTools?.stop()]);
+      await Promise.allSettled([this.q.interrupt(), this.agentTools?.stopForeground()]);
     } catch {
       /* 이미 끝난 경우 무시 */
     }
@@ -240,17 +259,20 @@ export class AgentSession {
     if (this.q) await this.q.setModel(model);
     this.o.model = model;
     this.activeModel = model;
+    this.runtimeStatus.invalidate();
   }
 
   async close(): Promise<void> {
     this.input.close();
     await this.agentTools?.close();
+    await this.backgroundTasks.stopAll();
     try {
       this.q?.close();
     } catch {
       /* noop */
     }
     await this.loop?.catch(() => undefined);
+    if(this.nativeUsagePending){this.o.tracker.ledger.usageIncomplete=true;this.o.tracker.addDelegated(0,{});}
   }
 
   private async consume(): Promise<void> {
@@ -311,13 +333,25 @@ export class AgentSession {
   }
 
   private handleSystem(msg: Record<string, any>): void {
+    if (msg.parent_tool_use_id) return;
+    this.runtimeStatus.observeSystem(msg);
+    if(msg.subtype==='status'&&msg.status==='requesting')this.nativeUsagePending=true;
+    if(this.backgroundTasks.observe('main',msg,(id)=>this.q!.stopTask(id))&&['task_started','task_notification'].includes(msg.subtype))this.notice(`Task ${msg.task_id}: ${msg.status??'started'}`);
+    if (msg.subtype === 'status' && msg.status === 'compacting') {
+      this.spinner.stop(); this.md.flush(); this.out(ui.dim('\nCompact: 압축 중…\n'));
+    }
+    if (msg.subtype === 'compact_boundary') {
+      this.spinner.stop(); this.md.flush(); this.out(ui.dim(`\n압축 완료 (${msg.compact_metadata?.trigger ?? '미확인'})\n`));
+    }
     if (msg.subtype === 'init') {
       this.sessionId = msg.session_id;
       this.apiKeySource = msg.apiKeySource;
+      if (msg.model && this.activeModel !== msg.model) this.runtimeStatus.invalidate();
       this.activeModel = msg.model ?? this.activeModel;
       this.sdkVersion = msg.claude_code_version;
       this.tools = msg.tools ?? [];
       this.o.tracker.bindSession(msg.session_id);
+      this.todos.bind(msg.session_id);
       if (msg.apiKeySource !== 'ANTHROPIC_API_KEY') {
         // Console API 키 이외의 인증(구독 OAuth 등)이 쓰이는 것을 막는다
         this.dead = `인증 출처가 ANTHROPIC_API_KEY 가 아닙니다(apiKeySource=${msg.apiKeySource}). 안전을 위해 중단합니다.`;
@@ -342,6 +376,9 @@ export class AgentSession {
   private handleStream(ev: Record<string, any>): void {
     switch (ev.type) {
       case 'message_start':
+        this.nativeUsagePending=true;
+        this.currentUsage = { ...(ev.message.usage ?? {}) };
+        this.runtimeStatus.observeCache(this.currentUsage, this.turnStartedAt);
         this.o.tracker.onMessageStart(ev.message.id, ev.message.model, ev.message.usage);
         this.currentMessageId = ev.message.id;
         return;
@@ -373,6 +410,8 @@ export class AgentSession {
         this.md.flush();
         return;
       case 'message_delta':
+        this.currentUsage = { ...this.currentUsage, ...(ev.usage ?? {}) };
+        this.runtimeStatus.observeCache(this.currentUsage, this.turnStartedAt);
         if (this.currentMessageId) this.o.tracker.onMessageDelta(this.currentMessageId, ev.usage);
         return;
       case 'message_stop':
@@ -383,11 +422,34 @@ export class AgentSession {
     }
   }
   private currentMessageId: string | undefined;
+  private currentUsage: Record<string,unknown> = {};
   private lastApiError: string | undefined;
   private interrupted = false;
 
+  private notice(text:string):void {this.spinner.stop();this.md.flush();this.out(ui.dim(`\n${text}\n`));this.o.onBackgroundUpdate?.();}
+  listTasks(){return [...(this.agentTools?.list().map(task=>({...task,task_id:task.agent_id,type:'agent'}))??[]),...this.backgroundTasks.list()];}
+  async taskStatus(id:string){return this.agentTools?.has(id)?this.agentTools.wait(id,0):this.backgroundTasks.read(id);}
+  async stopTask(id:string){return this.agentTools?.has(id)?this.agentTools.stopOne(id):this.backgroundTasks.stop(id);}
+
+  async refreshRuntimeStatus(): Promise<void> {
+    if (!this.q || this.contextQueryUnavailable) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const context = await Promise.race([this.q.getContextUsage({ detail: 'summary' }), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('context summary timeout')), 1500); })]);
+      this.runtimeStatus.observeContext(context);
+    } catch {
+      this.contextQueryUnavailable = true;
+      this.runtimeStatus.clearContext();
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
   private async handleResult(msg: SDKResultMessage): Promise<void> {
-    await this.agentTools?.stop();
+    const ids=msg.user_message_uuids??(msg.user_message_uuid?[msg.user_message_uuid]:[]);
+    // Synthetic background turns have no client UUID, even when queued_turn_count is 0.
+    // Only a matching send (or a session-scoped startup failure) may settle our waiter.
+    const startupFailure=msg.subtype!=='success'&&!!msg.startup_failure_reason;
+    const forPending=!!this.pending&&(ids.includes(this.pending.id)||startupFailure);
+    if(!this.pending||forPending)await this.agentTools?.stopForeground();
     this.spinner.stop();
     this.md.flush();
     this.printedHeader = false;
@@ -396,7 +458,9 @@ export class AgentSession {
       msg.total_cost_usd,
       msg.modelUsage as unknown as Record<string, SdkModelUsage>,
     );
+    this.nativeUsagePending=false;
     this.sessionId = msg.session_id;
+    await this.refreshRuntimeStatus();
     let error: string | undefined;
     if (msg.subtype === 'error_max_budget_usd') {
       error = `SDK 예산 한도(maxBudgetUsd)에 도달하여 중단되었습니다. 세션 누적 $${this.o.tracker.sessionCost.toFixed(4)}`;
@@ -410,7 +474,7 @@ export class AgentSession {
       error = this.lastApiError ? `요청 실패 [${e.category}]` : `[${e.category}] ${msg.result}\n  → ${e.hint}`;
     }
     this.lastApiError = undefined;
-    this.interrupted = false;
-    this.finishTurn({ result: msg, turnCostUsd: this.o.tracker.sessionCost - this.turnStartCost, error });
+    if(forPending){this.interrupted=false;this.finishTurn({ result: msg, turnCostUsd: this.o.tracker.sessionCost - this.turnStartCost, error });}
+    else this.notice('백그라운드 응답 처리 완료 · 비용 집계 갱신');
   }
 }
