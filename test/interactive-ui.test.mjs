@@ -47,7 +47,7 @@ test('arrows preserve the preferred column across empty lines and emoji', () => 
  ui.key('', {upArrow:true});
  assert.equal(ui.cursor, 'a😀c\n'.length);
  ui.key('', {upArrow:true});
- assert.equal(ui.cursor, 'a😀c'.length);
+ assert.equal(ui.cursor, 'a😀'.length);
  ui.key('', {downArrow:true});
  ui.key('', {downArrow:true});
  assert.equal(ui.cursor, 'a😀c\n\n123'.length);
@@ -71,5 +71,26 @@ test('empty Up recalls submitted prompts without sending or answering approvals'
  ui.key('', down); assert.equal(ui.draft, 'last');
  ui.key('', down); assert.equal(ui.draft, '');
  assert.deepEqual(ui.queue, queued);
+ ui.close();
+});
+
+test('arrows move across width-wrapped rows without changing submitted text', async () => {
+ const ui = new InteractiveInput();
+ ui.draftWidth = 4;
+ ui.insert('abcdefghij');
+ for (const offset of [6, 2]) {
+   ui.key('', {upArrow:true});
+   assert.equal(ui.cursor, offset);
+ }
+ for (const offset of [6, 10]) {
+   ui.key('', {downArrow:true});
+   assert.equal(ui.cursor, offset);
+ }
+ ui.key('', {upArrow:true});
+ ui.insert('!');
+ ui.submit();
+ assert.equal(await ui.readLine('> '), 'abcdef!ghij');
+ ui.key('', {upArrow:true});
+ assert.equal(ui.draft, 'abcdef!ghij');
  ui.close();
 });

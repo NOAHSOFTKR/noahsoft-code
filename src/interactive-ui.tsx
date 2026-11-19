@@ -1,3 +1,4 @@
+import { layoutDraft } from './draft-layout.js';
 import { modelCompletion } from './model-input.js';
 import type { InterruptKey } from './config.js';
 import { InkInput } from './ink-input.js';
@@ -13,6 +14,7 @@ type Question = { prompt: string; draft: string; resolve: (value: string | null)
 /** Input stays mounted during a turn. Only explicit submissions enter the FIFO. */
 export class InteractiveInput extends EventEmitter {
   draft = '';
+  draftWidth = Infinity;
   cursor = 0;
   transcript = '';
   queue: string[] = [];
@@ -53,17 +55,14 @@ export class InteractiveInput extends EventEmitter {
   }
 
   private moveVertical(direction: -1 | 1) {
-    const start = this.cursor === 0 ? 0 : this.draft.lastIndexOf('\n', this.cursor - 1) + 1;
-    const end = this.draft.indexOf('\n', this.cursor);
-    const hasAdjacentLine = direction === -1 ? start > 0 : end !== -1;
-    if (hasAdjacentLine) {
-      const targetStart = direction === -1
-        ? (start > 1 ? this.draft.lastIndexOf('\n', start - 2) + 1 : 0)
-        : end + 1;
-      const targetEnd = direction === -1 ? start - 1 : this.draft.indexOf('\n', targetStart);
-      const line = this.draft.slice(targetStart, targetEnd === -1 ? undefined : targetEnd);
-      this.preferredColumn ??= [...this.draft.slice(start, this.cursor)].length;
-      this.cursor = targetStart + [...line].slice(0, this.preferredColumn).join('').length;
+    const rows = layoutDraft(this.draft, this.draftWidth);
+    const index = rows.findLastIndex(row => row.positions[0].offset <= this.cursor);
+    const target = rows[index + direction];
+    if (target) {
+      const current = rows[index].positions.findLast(position => position.offset <= this.cursor);
+      this.preferredColumn ??= current?.column ?? 0;
+      const column = this.preferredColumn;
+      this.cursor = (target.positions.findLast(position => position.column <= column) ?? target.positions[0]).offset;
       this.changed();
       return;
     }
@@ -205,17 +204,28 @@ function Screen({ input }: { input: InteractiveInput }) {
   const height = Math.max(12, process.stdout.rows ?? 30);
   const side = input.panelVisible && width >= 90;
   const paneWidth = side ? width - 42 : width;
+  // Reserve a cell for the cursor so drawing it cannot rewrap the draft.
+  input.draftWidth = Math.max(1, paneWidth - 3);
+  const rows = useMemo(() => layoutDraft(input.draft, input.draftWidth), [input.draft, input.draftWidth]);
   const questionRows = input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').length : 1;
-  const inputLines = input.question ? Math.min(10, questionRows + 1) : Math.min(7, Math.max(2, wrapAnsi(input.draft, Math.max(1, paneWidth - 2), { hard: true }).split('\n').length + 1));
+  const inputLines = input.question ? Math.min(10, questionRows + 1) : Math.min(7, Math.max(2, rows.length + 1));
   const transcriptRows = Math.max(3, height - inputLines - (side || !input.panelVisible ? 6 : 11));
   const history = useMemo(() => wrapAnsi(input.transcript, Math.max(1, paneWidth), { hard: true }).split('\n'), [input.transcript, paneWidth]);
   input.maxScroll = Math.max(0, history.length - transcriptRows);
   const end = history.length - Math.min(input.scroll, input.maxScroll);
   const visible = history.slice(Math.max(0, end - transcriptRows), end).join('\n');
-  const draft = input.question ? input.question.draft : input.draft.slice(0, input.cursor) + '▌' + input.draft.slice(input.cursor);
-  const wrappedDraft = wrapAnsi(draft, Math.max(1, paneWidth - 2), { hard: true });
-  const cursorLine = wrapAnsi(input.draft.slice(0, input.cursor), Math.max(1, paneWidth - 2), { hard: true }).split('\n').length - 1;
-  const draftStart = input.question ? 0 : Math.max(0, cursorLine - 3);
+  const cursorLine = rows.findLastIndex(row => row.positions[0].offset <= input.cursor);
+  const draftStart = Math.max(0, cursorLine - 3);
+  const visibleDraft = input.question
+    ? wrapAnsi(input.question.draft, Math.max(1, paneWidth - 2), { hard: true }).split('\n').slice(0, 6).join('\n')
+    : rows.slice(draftStart, draftStart + 6).map((row, index) => {
+    if (draftStart + index !== cursorLine) return row.text;
+    const column = row.positions.findLastIndex(position => position.offset <= input.cursor);
+    // Match the layout's tab expansion when locating the cursor in displayed text.
+    const offset = row.positions[column].offset;
+    const displayIndex = input.draft.slice(row.positions[0].offset, offset).replaceAll('\t', ' '.repeat(Math.min(4, input.draftWidth))).length;
+    return row.text.slice(0, displayIndex) + '▌' + row.text.slice(displayIndex);
+  }).join('\n');
   if (!ready) return <Text>CVP UI 준비 중…</Text>;
   return <Box flexDirection="column" width={width} height={height - 1} overflow="hidden">
     <Text bold color="cyan" wrap="truncate-end">CVP CLI · {input.busy() ? '작업 중' : '입력 가능'} · 전송 대기 {input.queue.length}개</Text>
@@ -224,7 +234,7 @@ function Screen({ input }: { input: InteractiveInput }) {
         <Box flexGrow={1} flexShrink={1} minHeight={1} overflow="hidden"><Text wrap="wrap">{visible}</Text></Box>
         <Box borderStyle="round" borderColor={input.question ? 'yellow' : 'green'} flexDirection="column" flexShrink={0} height={inputLines + 2} overflow="hidden">
           <Text color={input.question ? 'yellow' : 'green'}>{input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').slice(-(inputLines - 1)).join('\n') : input.prompt}</Text>
-          <Text>{wrappedDraft.split('\n').slice(draftStart, draftStart + 6).join('\n')}</Text>
+          <Text>{visibleDraft}</Text>
         </Box>
       </Box>
       {input.panelVisible && <Box width={side ? 42 : width} height={side ? undefined : 5} borderStyle="round" borderColor={input.statusFocused ? "cyan" : "gray"} flexDirection="column" flexShrink={0} overflow="hidden"><Text bold>상태 · Tab/PgUp/PgDn 이동</Text><Text wrap="wrap">{wrapAnsi(input.status().map(clean).join('\n'), side ? 40 : Math.max(1, width - 2), { hard: true }).split('\n').slice(input.statusScroll).join('\n')}</Text></Box>}
