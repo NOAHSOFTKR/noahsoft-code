@@ -16,7 +16,7 @@ const WORKSPACE_ACTIONS = [
   '현재 초안 임시 보관',
   '임시 보관한 초안 복구',
   '모델 선택',
-  '상태 상세 / 요약 전환',
+  '상세 상태 패널 열기·닫기',
   '대화 기록 크게 보기',
   '기존 화면 모드로 돌아가기',
 ] as const;
@@ -40,18 +40,20 @@ export class InteractiveInput extends EventEmitter {
   cursor = 0;
   transcript = '';
   queue: string[] = [];
-  panelVisible = true;
+  panelVisible = false;
   modelIds: string[] = [];
   enhanced = false;
   onWorkspaceModeChange = (_enabled: boolean) => {};
-  detailedStatus = false;
   workspace?: WorkspaceOverlay;
   summaryStatus: () => string[] = () => [];
   currentModel: () => string = () => '';
   loadModelIds: () => Promise<string[]> = async () => [];
   recentModels: string[] = [];
-  displayStatus() {
-    return this.enhanced && !this.detailedStatus ? this.summaryStatus() : this.status();
+  toggleStatusPanel() {
+    this.panelVisible = !this.panelVisible;
+    this.statusFocused = false;
+    this.statusScroll = 0;
+    this.changed();
   }
   private queueRevision = 0;
   queueSelection?: { index: number; revision: number };
@@ -208,10 +210,8 @@ export class InteractiveInput extends EventEmitter {
         }
         case 4: this.openWorkspace('models'); break;
         case 5:
-          this.detailedStatus = !this.detailedStatus;
-          this.panelVisible = true;
-          this.statusScroll = 0;
           this.workspace = undefined;
+          this.toggleStatusPanel();
           break;
         case 6: this.openWorkspace('transcript'); break;
         case 7: this.toggleWorkspaceMode(); break;
@@ -237,7 +237,6 @@ export class InteractiveInput extends EventEmitter {
   private toggleWorkspaceMode() {
     this.enhanced = !this.enhanced;
     this.onWorkspaceModeChange(this.enhanced);
-    this.detailedStatus = false;
     this.statusScroll = 0;
     if (this.enhanced) this.openWorkspace();
     else this.workspace = undefined;
@@ -352,7 +351,7 @@ export class InteractiveInput extends EventEmitter {
     if (!value.trim()) { this.changed(); return; }
     if (value.trim().toLowerCase() === '/ui') { this.toggleWorkspaceMode(); return; }
     if (this.enhanced && value.trim().toLowerCase() === '/model') { this.openWorkspace('models'); return; }
-    if (value.trim() === '/status') { this.panelVisible = !this.panelVisible; this.changed(); return; }
+    if (value.trim().toLowerCase() === '/status') { this.toggleStatusPanel(); return; }
     this.rememberPrompt(value);
     this.dispatch(value, interrupt);
   }
@@ -450,8 +449,8 @@ export class InteractiveInput extends EventEmitter {
       this.changed();
       return;
     }
-    if (key.tab && !this.question) { this.statusFocused = !this.statusFocused; this.changed(); return; }
-    if (key.pageUp || key.pageDown) { if (this.statusFocused) this.statusScroll = Math.max(0, Math.min(this.displayStatus().length - 1, this.statusScroll + (key.pageUp ? -5 : 5))); else { this.scrollTranscript(key.pageUp ? 10 : -10); return; } this.changed(); return; }
+    if (key.tab && !this.question && this.panelVisible) { this.statusFocused = !this.statusFocused; this.changed(); return; }
+    if (key.pageUp || key.pageDown) { if (this.statusFocused) this.statusScroll = Math.max(0, Math.min(this.status().length - 1, this.statusScroll + (key.pageUp ? -5 : 5))); else { this.scrollTranscript(key.pageUp ? 10 : -10); return; } this.changed(); return; }
     if (this.interruptKey && key.ctrl && !key.shift && !key.meta && !key.super &&
         this.interruptKey === `ctrl+${input}`) {
       if (!this.question && key.eventType !== 'repeat') this.submit(true);
@@ -551,7 +550,8 @@ function Screen({ input }: { input: InteractiveInput }) {
   const height = Math.max(12, process.stdout.rows ?? 30);
   input.transcriptViewWidth = Math.max(1, width - 4);
   input.transcriptViewRows = Math.max(1, height - 6);
-  const panelWidth = input.enhanced && !input.detailedStatus ? 27 : 42;
+  const panelWidth = 42;
+  const summaryRows = input.panelVisible ? 0 : 1;
   const side = input.panelVisible && width >= 90;
   const paneWidth = side ? width - panelWidth : width;
   const panelRows = side ? undefined : 5;
@@ -564,7 +564,7 @@ function Screen({ input }: { input: InteractiveInput }) {
   const selectedQueueIndex = Math.min(input.queueSelection?.index ?? input.queue.length - 1, input.queue.length - 1);
   const queueStart = Math.max(0, Math.min(selectedQueueIndex, input.queue.length - queueRows));
   const showQueue = !input.question && (queueRows > 0 || !!input.queueSelection);
-  const transcriptRows = Math.max(1, height - inputLines - (side || !input.panelVisible ? 6 : 11) - (showQueue ? queueRows + 1 : 0));
+  const transcriptRows = Math.max(1, height - inputLines - (side || !input.panelVisible ? 6 : 11) - summaryRows - (showQueue ? queueRows + 1 : 0));
   const history = useMemo(() => wrapAnsi(input.transcript, Math.max(1, paneWidth), { hard: true }).split('\n'), [input.transcript, paneWidth]);
   input.maxScroll = Math.max(0, history.length - transcriptRows);
   const end = history.length - Math.min(input.scroll, input.maxScroll);
@@ -584,10 +584,11 @@ function Screen({ input }: { input: InteractiveInput }) {
   if (!ready) return <Text>CVP UI 준비 중…</Text>;
   return <Box flexDirection="column" width={width} height={height - 1} overflow="hidden">
     <Text bold color="cyan" wrap="truncate-end">CVP CLI{input.enhanced ? ' · 작업 모드' : ''} · {input.busy() ? '작업 중' : '입력 가능'} · 전송 대기 {input.queue.length}개{input.busy() && ' · Alt+S 지시 추가'}</Text>
+    {!input.panelVisible && <Text dimColor wrap="truncate-end">{input.summaryStatus().map(clean).join(' · ')}</Text>}
     {input.workspace && !input.question
       ? <WorkspaceOverlayView input={input} maxRows={Math.max(2, Math.min(8, height - 8))}/>
       : <Box flexGrow={1} flexDirection={side ? 'row' : 'column'}>
-      <Box flexDirection="column" flexGrow={1} flexShrink={0} width={paneWidth} height={side || !input.panelVisible ? height - 3 : height - 8}>
+      <Box flexDirection="column" flexGrow={1} flexShrink={0} width={paneWidth} height={height - (side || !input.panelVisible ? 3 : 8) - summaryRows}>
         <Box flexGrow={1} flexShrink={1} minHeight={1} overflow="hidden"><Text wrap="wrap">{visible}</Text></Box>
         {showQueue && <Box flexDirection="column" flexShrink={0}>
           <Text color="yellow" wrap="truncate-end">
@@ -606,7 +607,7 @@ function Screen({ input }: { input: InteractiveInput }) {
           <Text>{visibleDraft}</Text>
         </Box>
       </Box>
-      {input.panelVisible && <Box width={side ? panelWidth : width} height={panelRows} borderStyle="round" borderColor={input.statusFocused ? "cyan" : "gray"} flexDirection="column" flexShrink={0} overflow="hidden"><Text bold>상태 · Tab/PgUp/PgDn 이동</Text><Text wrap="wrap">{wrapAnsi(input.displayStatus().map(clean).join('\n'), side ? panelWidth - 2 : Math.max(1, width - 2), { hard: true }).split('\n').slice(input.statusScroll).join('\n')}</Text></Box>}
+      {input.panelVisible && <Box width={side ? panelWidth : width} height={panelRows} borderStyle="round" borderColor={input.statusFocused ? "cyan" : "gray"} flexDirection="column" flexShrink={0} overflow="hidden"><Text bold>상태 · Tab/PgUp/PgDn 이동</Text><Text wrap="wrap">{wrapAnsi(input.status().map(clean).join('\n'), side ? panelWidth - 2 : Math.max(1, width - 2), { hard: true }).split('\n').slice(input.statusScroll).join('\n')}</Text></Box>}
     </Box>}
     <Text dimColor wrap="truncate-end">{input.modelSuggestion ? `Tab 자동완성 · ${input.modelSuggestion}` : <>{input.enhanced ? 'Alt+M 작업 메뉴 · Alt+P 모델 · Ctrl+R 기록 · ' : '/ui 작업 모드 · '}Enter {input.enterAction} · Ctrl+Enter {input.ctrlEnterAction} · Shift+Enter {input.shiftEnterAction}{input.interruptKey ? ` · ${input.interruptKey} interrupt` : ''} · 휠/PgUp/PgDn 기록 · Shift+드래그 선택</>}</Text>
   </Box>;

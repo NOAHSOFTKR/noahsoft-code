@@ -12,6 +12,13 @@ for(const term of ['xterm-256color','dumb'])test(`TTY ${term}: background 승인
  try{
   const cfg=resolveConfig({model:'claude-sonnet-5-5',cwd:ws.work,budget:5,subagentTools:true});
   running=runRepl({apiKey:TEST_KEY,cfg,model:cfg.model,raw:true});await waitFor(()=>screen.includes('> '));
+  assert.match(screen, /모델: claude-sonnet-5-5 · 권한: default · 남은 예산:/);
+  assert.doesNotMatch(screen, /AutoCompact:/);
+  input.write('/status');input.write('\x1b[13;5u');
+  await waitFor(()=>screen.includes('AutoCompact:'));
+  screen='';
+  input.write('/status');input.write('\x1b[13;5u');
+  await waitFor(()=>screen.includes('모델: claude-sonnet-5-5 · 권한: default'));
   input.write('RUN_BACKGROUND_AGENT_WRITE');input.write('\x1b[13;5u');
   await waitFor(()=>screen.includes('AutoCompact:'));input.write('draft text');
   await waitFor(()=>screen.includes('허용할까요?'));input.write('y');await new Promise(r=>setTimeout(r,30));input.write('\r');

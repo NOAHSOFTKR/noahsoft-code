@@ -183,9 +183,9 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     interactive.currentModel = () => session.activeModel;
     interactive.loadModelIds = async () => (await listModels(apiClient(ctx.apiKey))).map(item => item.id);
     interactive.summaryStatus = () => [
-      `남은 예산: ${fmtUsd(tracker.remainingUsd)}${tracker.ledger.usageIncomplete ? ' (추정)' : ''}`,
+      `모델: ${session.activeModel}`,
       `권한: ${permState.mode}`,
-      `작업: ${session.busy ? '진행 중' : '대기'} · BG ${session.listTasks().filter(task => task.status === 'running').length}`,
+      `남은 예산: ${fmtUsd(tracker.remainingUsd)}${tracker.ledger.usageIncomplete ? ' (추정)' : ''}`,
     ];
     interactive.onInterrupt = onSigint;
     interactive.enterAction = cfg.enterAction;
@@ -281,7 +281,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
       return true;
     },
     async status() {
-      if (interactive) { interactive.panelVisible = !interactive.panelVisible; interactive.changed(); return; }
+      if (interactive) { interactive.toggleStatusPanel(); return; }
       const base = process.env.ANTHROPIC_BASE_URL;
       write(
         [

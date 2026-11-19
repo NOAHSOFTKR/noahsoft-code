@@ -19,7 +19,16 @@ test('normal Enter, CtrlJ fallback and configurable swap dispatch correct action
  assert.equal(await ui.readLine('> '),'two\n');ui.insert('three');ui.key('',enter);assert.equal(await ui.readLine('> '),'three');ui.close();
 });
 test('single line slash Enter and status toggle honor configuration',async()=>{
- const ui=new InteractiveInput();ui.insert('/status');ui.key('',enter);assert.equal(ui.panelVisible,false);assert.equal(ui.queue.length,0);
+ const ui = new InteractiveInput();
+ assert.equal(ui.panelVisible, false);
+ ui.insert('/status'); ui.key('', enter);
+ assert.equal(ui.panelVisible, true);
+ ui.key('', {tab:true});
+ assert.equal(ui.statusFocused, true);
+ ui.insert('/status'); ui.key('', enter);
+ assert.equal(ui.panelVisible, false);
+ assert.equal(ui.statusFocused, false);
+ assert.equal(ui.queue.length, 0);
  ui.insert('/help');ui.key('',enter);assert.equal(await ui.readLine('> '),'/help');
  ui.slashEnterSubmit=false;ui.insert('/help');ui.key('',enter);assert.equal(ui.draft,'/help\n');ui.close();
 });
