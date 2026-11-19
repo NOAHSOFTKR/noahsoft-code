@@ -8,7 +8,7 @@ import { listSessions } from '@anthropic-ai/claude-agent-sdk';
 import { AgentSession } from './agent.js';
 import { maskKey } from './auth.js';
 import { BudgetExceededError, CostTracker, loadLedger } from './cost.js';
-import type { ResolvedConfig } from './config.js';
+import { setConfigValue, type ResolvedConfig } from './config.js';
 import { apiClient, listModels, probeModel } from './models.js';
 import { CYCLE_MODES, MODE_INFO, newPermissionState, parsePermissionMode, PathGuard, PERMISSION_MODES, type CvpPermissionMode } from './permissions.js';
 import { ui } from './render.js';
@@ -24,7 +24,7 @@ export interface ReplContext {
 
 const HELP = `
 ${chalk.bold('내부 명령어')}
-  /help              명령어 안내
+  /help              명령어 안내 (작업 중 Alt+S: 현재 작업에 지시 추가)
   /ui                작업 모드 전환 (대기열·초안·기록·모델)
   /model [id]        현재 모델 조회 / 모델 변경(실제 API 호출로 권한 검증 후 적용)
   /mode [모드]       권한 모드 조회 / 변경 (default | acceptEdits | plan | bypass | fullbypass)
@@ -56,6 +56,7 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
   const { cfg } = ctx;
   let atMainPrompt = false;
   const interactive = process.stdin.isTTY && process.stdout.isTTY ? new InteractiveInput(new PromptHistory(cfg.cwd)) : undefined;
+  if (interactive) interactive.enhanced = cfg.workspaceMode;
   let disposeUi: (() => void) | undefined;
   const write = (text: string) => { if (interactive) interactive.write(text); else process.stdout.write(text); };
   const input = interactive ? new PassThrough() : process.stdin;
@@ -171,6 +172,13 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
   };
   rl.on('SIGINT', onSigint);
   if (interactive) {
+    interactive.onWorkspaceModeChange = enabled => {
+      try {
+        setConfigValue('workspaceMode', String(enabled));
+      } catch (error) {
+        write(ui.warn(`화면 모드 설정 저장 실패: ${(error as Error).message}\n`));
+      }
+    };
     interactive.modelIds = [ctx.model];
     interactive.currentModel = () => session.activeModel;
     interactive.loadModelIds = async () => (await listModels(apiClient(ctx.apiKey))).map(item => item.id);
@@ -185,6 +193,14 @@ export async function runRepl(ctx: ReplContext): Promise<void> {
     interactive.interruptKey = cfg.interruptKey;
     interactive.shiftEnterAction = cfg.shiftEnterAction;
     interactive.slashEnterSubmit = cfg.slashEnterSubmit;
+    interactive.onSteer = text => {
+      try {
+        return session.steer(text);
+      } catch (error) {
+        write(ui.warn(`Steer 전송 실패: ${(error as Error).message}\n`));
+        return false;
+      }
+    };
     interactive.onInterruptPrompt = () => { if (session.busy) void interrupt(); };
     interactive.onCycle = () => { if (session.busy) return; const i = CYCLE_MODES.indexOf(permState.mode); permState.mode = CYCLE_MODES[(i + 1) % CYCLE_MODES.length]; announceMode(); };
     interactive.busy = () => session.busy;

@@ -43,6 +43,7 @@ export class InteractiveInput extends EventEmitter {
   panelVisible = true;
   modelIds: string[] = [];
   enhanced = false;
+  onWorkspaceModeChange = (_enabled: boolean) => {};
   detailedStatus = false;
   workspace?: WorkspaceOverlay;
   summaryStatus: () => string[] = () => [];
@@ -186,6 +187,7 @@ export class InteractiveInput extends EventEmitter {
 
   private toggleWorkspaceMode() {
     this.enhanced = !this.enhanced;
+    this.onWorkspaceModeChange(this.enhanced);
     this.detailedStatus = false;
     this.statusScroll = 0;
     if (this.enhanced) this.openWorkspace();
@@ -218,6 +220,7 @@ export class InteractiveInput extends EventEmitter {
   onInterrupt = () => {};
   onCycle = () => {};
   onInterruptPrompt = () => {};
+  onSteer = (_text: string) => false;
   enterAction: 'newline' | 'queue' | 'interrupt' = 'newline';
   ctrlEnterAction: 'newline' | 'queue' | 'interrupt' = 'queue';
   shiftEnterAction: 'newline' | 'queue' | 'interrupt' = 'interrupt';
@@ -238,6 +241,12 @@ export class InteractiveInput extends EventEmitter {
   }
 
   private moveVertical(direction: -1 | 1) {
+    if (direction === -1 && this.draft === '' && this.queue.length > 0) {
+      const entry = this.queue.pop()!;
+      this.queueRevision++;
+      this.useDraft(entry);
+      return;
+    }
     const rows = layoutDraft(this.draft, this.draftWidth);
     const index = rows.findLastIndex(row => row.positions[0].offset <= this.cursor);
     const target = rows[index + direction];
@@ -294,14 +303,33 @@ export class InteractiveInput extends EventEmitter {
     if (value.trim().toLowerCase() === '/ui') { this.toggleWorkspaceMode(); return; }
     if (this.enhanced && value.trim().toLowerCase() === '/model') { this.openWorkspace('models'); return; }
     if (value.trim() === '/status') { this.panelVisible = !this.panelVisible; this.changed(); return; }
-    if (!value.trimStart().startsWith('/')) {
-      if (this.promptHistory.at(-1) !== value) {
-        this.promptHistory.push(value);
-        if (this.promptHistory.length > PROMPT_HISTORY_LIMIT) this.promptHistory.shift();
-      }
-      this.savedHistory?.append(value);
-    }
+    this.rememberPrompt(value);
     this.dispatch(value, interrupt);
+  }
+
+  private rememberPrompt(value: string) {
+    if (value.trimStart().startsWith('/')) return;
+    if (this.promptHistory.at(-1) !== value) {
+      this.promptHistory.push(value);
+      if (this.promptHistory.length > PROMPT_HISTORY_LIMIT) this.promptHistory.shift();
+    }
+    this.savedHistory?.append(value);
+  }
+
+  private submitSteer() {
+    const value = this.draft.trim();
+    if (this.closed || !value) return;
+    if (value.startsWith('/')) {
+      this.write('Steer에는 일반 프롬프트를 입력해 주세요.\n');
+      return;
+    }
+    if (!this.onSteer(value)) {
+      this.write('Steer를 받을 수 있는 실행 중 요청이 없어요. 초안을 유지했습니다.\n');
+      return;
+    }
+    this.rememberPrompt(this.draft);
+    this.cancelDraft(false, false);
+    this.write(`\n> [Steer · 반영 확인 대기] ${value}\n`);
   }
 
   private dispatch(value: string, interrupt: boolean) {
@@ -343,6 +371,10 @@ export class InteractiveInput extends EventEmitter {
     if (this.enhanced && key.eventType === 'repeat' && key.return && !this.question) return;
     if (key.ctrl && input === 'c') { this.onInterrupt(); return; }
     if (key.ctrl && input === 'd') { this.onInterruptPrompt(); this.close(); return; }
+    if (key.meta && !key.ctrl && !key.shift && !key.super && !key.hyper && input === 's') {
+      if (!this.question && !this.workspace && key.eventType !== 'repeat') this.submitSteer();
+      return;
+    }
     if (this.enhanced && !this.question) {
       if (key.ctrl && !key.meta && !key.shift && !key.super && !key.hyper && input === 'r') {
         this.openWorkspace('history');
@@ -474,7 +506,9 @@ function Screen({ input }: { input: InteractiveInput }) {
   const rows = useMemo(() => layoutDraft(input.draft, input.draftWidth), [input.draft, input.draftWidth]);
   const questionRows = input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').length : 1;
   const inputLines = input.question ? Math.min(10, questionRows + 1) : Math.min(7, Math.max(2, rows.length + 1));
-  const transcriptRows = Math.max(3, height - inputLines - (side || !input.panelVisible ? 6 : 11));
+  const pending = input.queue.at(-1);
+  const showQueuePreview = pending !== undefined && !input.question;
+  const transcriptRows = Math.max(1, height - inputLines - (side || !input.panelVisible ? 6 : 11) - (showQueuePreview ? 2 : 0));
   const history = useMemo(() => wrapAnsi(input.transcript, Math.max(1, paneWidth), { hard: true }).split('\n'), [input.transcript, paneWidth]);
   input.maxScroll = Math.max(0, history.length - transcriptRows);
   const end = history.length - Math.min(input.scroll, input.maxScroll);
@@ -493,12 +527,16 @@ function Screen({ input }: { input: InteractiveInput }) {
   }).join('\n');
   if (!ready) return <Text>CVP UI 준비 중…</Text>;
   return <Box flexDirection="column" width={width} height={height - 1} overflow="hidden">
-    <Text bold color="cyan" wrap="truncate-end">CVP CLI{input.enhanced ? ' · 작업 모드' : ''} · {input.busy() ? '작업 중' : '입력 가능'} · 전송 대기 {input.queue.length}개</Text>
+    <Text bold color="cyan" wrap="truncate-end">CVP CLI{input.enhanced ? ' · 작업 모드' : ''} · {input.busy() ? '작업 중' : '입력 가능'} · 전송 대기 {input.queue.length}개{input.busy() && ' · Alt+S 지시 추가'}</Text>
     {input.workspace && !input.question
       ? <WorkspaceOverlayView input={input} maxRows={Math.max(2, Math.min(8, height - 8))}/>
       : <Box flexGrow={1} flexDirection={side ? 'row' : 'column'}>
       <Box flexDirection="column" flexGrow={1} flexShrink={0} width={paneWidth} height={side || !input.panelVisible ? height - 3 : height - 8}>
         <Box flexGrow={1} flexShrink={1} minHeight={1} overflow="hidden"><Text wrap="wrap">{visible}</Text></Box>
+        {showQueuePreview && <Box flexDirection="column" flexShrink={0}>
+          <Text color="yellow" wrap="truncate-end">대기 {input.queue.length}개 · 빈 입력창에서 ↑ 표시된 요청 회수</Text>
+          <Text wrap="truncate-end">{pending.replace(/\s+/g, ' ').trim()}</Text>
+        </Box>}
         <Box borderStyle="round" borderColor={input.question ? 'yellow' : 'green'} flexDirection="column" flexShrink={0} height={inputLines + 2} overflow="hidden">
           <Text color={input.question ? 'yellow' : 'green'}>{input.question ? wrapAnsi(input.question.prompt, Math.max(1, paneWidth - 2), { hard: true }).split('\n').slice(-(inputLines - 1)).join('\n') : input.prompt}</Text>
           <Text>{visibleDraft}</Text>

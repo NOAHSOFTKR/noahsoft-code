@@ -33,6 +33,7 @@ function parseInterruptKey(value: unknown): InterruptKey {
 }
 
 export interface FileConfig {
+  workspaceMode?: boolean;
   interruptKey?: InterruptKey;
   enterAction?: InputAction;
   ctrlEnterAction?: InputAction;
@@ -54,6 +55,7 @@ export interface FileConfig {
 }
 
 const CONFIG_KEYS: Record<string, 'string' | 'number' | 'boolean' | 'list' | 'mode' | 'effort' | 'inputAction' | 'interruptKey'> = {
+  workspaceMode: 'boolean',
   interruptKey: 'interruptKey',
   enterAction: 'inputAction',
   ctrlEnterAction: 'inputAction',
@@ -159,6 +161,7 @@ export function loadDotEnv(cwd: string): string | undefined {
 }
 
 export interface ResolvedConfig {
+  workspaceMode: boolean;
   interruptKey?: InterruptKey;
   enterAction: InputAction;
   ctrlEnterAction: InputAction;
@@ -234,6 +237,7 @@ export function resolveConfig(flags: { supervised?: boolean; subagentTools?: boo
     throw new Error('slashEnterSubmit에는 true 또는 false가 필요합니다.');
   }
   return {
+    workspaceMode: file.workspaceMode === true,
     interruptKey: file.interruptKey === undefined ? undefined : parseInterruptKey(file.interruptKey),
     enterAction, ctrlEnterAction, shiftEnterAction, slashEnterSubmit: file.slashEnterSubmit ?? true,
     model,

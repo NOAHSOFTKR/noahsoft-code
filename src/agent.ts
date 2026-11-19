@@ -121,6 +121,12 @@ export class AgentSession {
   private nativeUsagePending = false;
   private input = new InputQueue();
   private pending: { id: string; resolve: (o: TurnOutcome) => void } | undefined;
+  private steerIds = new Map<string, number>();
+  private steerSequence = 0;
+  private rootResultReceived = false;
+  private turnError: string | undefined;
+  private canSteer = false;
+  private steerReceiptTimer?: ReturnType<typeof setTimeout>;
   private loop: Promise<void> | undefined;
   private spinner: Spinner;
   private md: MarkdownStream;
@@ -215,6 +221,14 @@ export class AgentSession {
     this.spinner.stop();
     this.md.flush();
     this.busy = false;
+    this.canSteer = false;
+    this.rootResultReceived = false;
+    this.turnError = undefined;
+    this.interrupted = false;
+    if (this.steerReceiptTimer) clearTimeout(this.steerReceiptTimer);
+    this.steerReceiptTimer = undefined;
+    if (this.steerIds.size) this.out(ui.warn(`\nSteer · 지시 ${this.steerIds.size}건 처리 미확인\n`));
+    this.steerIds.clear();
     const p = this.pending;
     this.pending = undefined;
     p?.resolve(o);
@@ -229,24 +243,52 @@ export class AgentSession {
     this.turnStartCost = this.o.tracker.sessionCost;
     this.turnStartedAt = Date.now();
     this.busy = true;
+    this.canSteer = !text.trimStart().startsWith('/');
     this.lastText = '';
     const id=randomUUID();
     const done = new Promise<TurnOutcome>((resolve) => (this.pending = { id, resolve }));
     this.spinner.start('응답 대기 중… (Ctrl+C 중단)');
+    this.input.push({
+      type: 'user',
+      uuid: id,
+      message: { role: 'user', content: this.withPermissionReminder(text) },
+      parent_tool_use_id: null,
+    } as SDKUserMessage);
+    return done;
+  }
+
+  private withPermissionReminder(text: string): string {
     // plan 모드에서는 모델이 실행 대신 계획을 세우도록 짧은 안내를 덧붙인다
-    const content =
-      this.o.permState.mode === 'plan' && !/^\/compact(?:\s|$)/.test(text)
+    return this.o.permState.mode === 'plan' && !/^\/compact(?:\s|$)/.test(text)
         ? `${text}
 
 [CVP CLI 안내: 현재 plan(읽기 전용) 모드입니다. 파일을 수정하거나 명령을 실행하지 말고, 필요한 파일을 읽은 뒤 구체적인 변경 계획을 제시하세요.]`
         : this.o.permState.mode === 'fullbypass' && !/^\/compact(?:\s|$)/.test(text) ? `${text}\n\n[CVP CLI: fullbypass 모드, 사용자 감독 확인됨. 위험 명령·작업 폴더 밖 파일 도구 접근도 자동 승인됩니다. 인증·예산·도구 구성 제한은 유지됩니다.]` : text;
-    this.input.push({
-      type: 'user',
-      uuid: id,
-      message: { role: 'user', content },
-      parent_tool_use_id: null,
-    } as SDKUserMessage);
-    return done;
+  }
+
+  /** Submit directly to the SDK without stopping the active turn or draining the local FIFO. */
+  steer(text: string): boolean {
+    const value = text.trim();
+    if (!this.pending || !this.busy || !this.canSteer || this.interrupted || this.dead ||
+        !value || value.startsWith('/') || this.steerIds.size >= 16) return false;
+    const id = randomUUID();
+    try {
+      this.o.tracker.assertWithinBudget();
+      this.input.push({
+        type: 'user',
+        uuid: id,
+        priority: 'next',
+        client_composed: true,
+        message: { role: 'user', content: this.withPermissionReminder(value) },
+        parent_tool_use_id: null,
+      } as SDKUserMessage);
+    } catch {
+      return false;
+    }
+    const sequence = ++this.steerSequence;
+    this.steerIds.set(id, sequence);
+    this.out(ui.dim(`\nSteer #${sequence} · SDK에 전송 · 처리 결과 확인 중\n`));
+    return true;
   }
 
   async interrupt(): Promise<void> {
@@ -270,6 +312,7 @@ export class AgentSession {
   }
 
   async close(): Promise<void> {
+    this.canSteer = false;
     this.input.close();
     await this.agentTools?.close();
     await this.backgroundTasks.stopAll();
@@ -294,6 +337,10 @@ export class AgentSession {
         return this.handleSystem(msg as SDKMessage & { type: 'system' });
       case 'stream_event':
         if (msg.parent_tool_use_id) return;
+        if (msg.user_message_uuid && this.steerIds.has(msg.user_message_uuid) && this.steerReceiptTimer) {
+          clearTimeout(this.steerReceiptTimer);
+          this.steerReceiptTimer = undefined;
+        }
         return this.handleStream(msg.event as unknown as Record<string, any>);
       case 'assistant': {
         if (msg.parent_tool_use_id) return;
@@ -455,8 +502,11 @@ export class AgentSession {
     // Synthetic background turns have no client UUID, even when queued_turn_count is 0.
     // Only a matching send (or a session-scoped startup failure) may settle our waiter.
     const startupFailure=msg.subtype!=='success'&&!!msg.startup_failure_reason;
-    const forPending=!!this.pending&&(ids.includes(this.pending.id)||startupFailure);
-    if(!this.pending||forPending)await this.agentTools?.stopForeground();
+    const forOriginal = !!this.pending && ids.includes(this.pending.id);
+    const forSteer = ids.some(id => this.steerIds.has(id));
+    const forPending = !!this.pending && (forOriginal || forSteer || startupFailure);
+    if (forPending) this.canSteer = false;
+    if (!this.pending || forPending) await this.agentTools?.stopForeground();
     this.spinner.stop();
     this.md.flush();
     this.printedHeader = false;
@@ -481,7 +531,37 @@ export class AgentSession {
       error = this.lastApiError ? `요청 실패 [${e.category}]` : `[${e.category}] ${msg.result}\n  → ${e.hint}`;
     }
     this.lastApiError = undefined;
-    if(forPending){this.interrupted=false;this.finishTurn({ result: msg, turnCostUsd: this.o.tracker.sessionCost - this.turnStartCost, error });}
-    else this.notice('백그라운드 응답 처리 완료 · 비용 집계 갱신');
+    if (!forPending) {
+      this.notice('백그라운드 응답 처리 완료 · 비용 집계 갱신');
+      return;
+    }
+
+    if (forOriginal) this.rootResultReceived = true;
+    this.turnError ??= error;
+    this.interrupted = false;
+    for (const id of ids) {
+      const sequence = this.steerIds.get(id);
+      if (sequence === undefined) continue;
+      this.steerIds.delete(id);
+      const scope = forOriginal ? '같은 턴' : '후속 턴';
+      this.out(error
+        ? ui.warn(`\nSteer #${sequence} · ${scope} 결과에 포함됐지만 실행 실패\n`)
+        : ui.ok(`\nSteer #${sequence} · ${scope}에서 처리됨\n`));
+    }
+    const outcome = { result: msg, turnCostUsd: this.o.tracker.sessionCost - this.turnStartCost, error: this.turnError };
+    if (startupFailure || (this.rootResultReceived && !this.steerIds.size)) {
+      this.finishTurn(outcome);
+      return;
+    }
+    if (this.rootResultReceived && this.steerIds.size && (msg.queued_turn_count ?? 0) === 0) {
+      // Allow input already in transit to enter the runtime before treating it as unconfirmed.
+      // Stop this SDK stream on ambiguity rather than replaying a prompt that may be executing.
+      if (this.steerReceiptTimer) clearTimeout(this.steerReceiptTimer);
+      this.steerReceiptTimer = setTimeout(() => {
+        this.dead = 'Steer 처리 결과를 확인하지 못해 세션 연결을 종료했습니다.';
+        try { this.q?.close(); } catch { /* session already closed */ }
+        this.finishTurn({ ...outcome, error: this.dead });
+      }, 15_000);
+    }
   }
 }

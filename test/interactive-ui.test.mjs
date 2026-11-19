@@ -66,11 +66,13 @@ test('empty Up recalls submitted prompts without sending or answering approvals'
  assert.equal(ui.draft, '');
  ui.insert('n'); ui.key('', enter);
  assert.equal(await answer, 'n');
+ assert.deepEqual(ui.queue, queued);
+ for (const value of queued) assert.equal(await ui.readLine('> '), value);
  ui.key('', up); assert.equal(ui.draft, 'last');
  ui.key('', up); assert.equal(ui.draft, 'first');
  ui.key('', down); assert.equal(ui.draft, 'last');
  ui.key('', down); assert.equal(ui.draft, '');
- assert.deepEqual(ui.queue, queued);
+ assert.deepEqual(ui.queue, []);
  ui.close();
 });
 
@@ -153,5 +155,54 @@ test('workspace history search restores a prompt for editing without submitting 
  ui.key('', enter);
  assert.equal(ui.draft, 'find the logger');
  assert.deepEqual(ui.queue, ['find the logger', 'check tests']);
+ ui.close();
+});
+
+test('empty Up directly recalls the previewed queue tail without submitting', async () => {
+ const ui = new InteractiveInput();
+ ui.insert('keep first'); ui.submit();
+ ui.insert('fix typo\nsecond row'); ui.submit();
+ ui.key('', {upArrow:true});
+ assert.equal(ui.draft, 'fix typo\nsecond row');
+ assert.deepEqual(ui.queue, ['keep first']);
+ assert.equal(await ui.readLine('> '), 'keep first');
+ ui.close();
+});
+
+test('workspace mode changes report both selections for persistence', () => {
+ const ui = new InteractiveInput();
+ const selections = [];
+ ui.onWorkspaceModeChange = enabled => selections.push(enabled);
+ ui.insert('/ui'); ui.submit();
+ ui.key('', {escape:true});
+ ui.insert('/ui'); ui.submit();
+ assert.deepEqual(selections, [true, false]);
+ ui.close();
+});
+
+test('Alt+S sends a separate Steer action and keeps drafts when unavailable', async () => {
+ const ui = new InteractiveInput();
+ const steers = [];
+ let interrupts = 0;
+ const steerKey = {meta:true};
+ ui.onInterruptPrompt = () => interrupts++;
+ ui.insert('ordinary queued'); ui.submit();
+ ui.insert('leave that file alone');
+ ui.key('s', steerKey);
+ assert.equal(ui.draft, 'leave that file alone');
+ ui.onSteer = text => { steers.push(text); return true; };
+ const approval = ui.ask('allow?');
+ ui.key('s', steerKey);
+ assert.deepEqual(steers, []);
+ ui.insert('n'); ui.key('', enter);
+ assert.equal(await approval, 'n');
+ ui.key('s', {...steerKey,eventType:'repeat'});
+ assert.deepEqual(steers, []);
+ ui.key('s', steerKey);
+ assert.deepEqual(steers, ['leave that file alone']);
+ assert.deepEqual(ui.queue, ['ordinary queued']);
+ assert.equal(ui.draft, '');
+ assert.equal(interrupts, 0);
+ assert.match(ui.transcript, /Steer · 반영 확인 대기/);
  ui.close();
 });

@@ -8,6 +8,11 @@ test('Enter key actions: defaults, persisted customization and invalid configura
  const saved=process.env.CVP_HOME, ws=tempWorkspace(); process.env.CVP_HOME=ws.home;
  try {
   let cfg=resolveConfig({});
+  assert.equal(cfg.workspaceMode, false);
+  setConfigValue('workspaceMode','true');
+  assert.equal(resolveConfig({}).workspaceMode, true);
+  setConfigValue('workspaceMode','false');
+  assert.equal(resolveConfig({}).workspaceMode, false);
   assert.deepEqual([cfg.enterAction,cfg.ctrlEnterAction,cfg.shiftEnterAction,cfg.slashEnterSubmit],['newline','queue','interrupt',true]);
   setConfigValue('enterAction','queue');setConfigValue('ctrlEnterAction','interrupt');setConfigValue('shiftEnterAction','newline');setConfigValue('slashEnterSubmit','false');
   cfg=resolveConfig({});

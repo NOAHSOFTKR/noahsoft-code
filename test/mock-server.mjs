@@ -20,7 +20,7 @@ function textOf(content) {
     .join('\n');
 }
 
-export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels = [], status = {}, cacheReadTokens = 0, cacheWriteTokens = 0 } = {}) {
+export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels = [], status = {}, cacheReadTokens = 0, cacheWriteTokens = 0, beforeNoToolResponse } = {}) {
   const log = [];
   let n = 0;
   const server = http.createServer((req, res) => {
@@ -168,6 +168,12 @@ export function startMock({ inputTokens = 1000, outputTokens = 50, deniedModels 
           return sse(res, [start, ...text(`기억: ${all.includes('BANANA') ? 'BANANA 발견' : '없음'}\n`), ...end('end_turn')]);
         }
         if (lastText.includes('PRIORITY_NOW') || lastText.includes('QUEUED_NEXT')) return sse(res, [start, ...text('follow-up complete\n'), ...end('end_turn')]);
+        if (beforeNoToolResponse && lastText.includes('STEER_NO_TOOL_ROOT')) {
+          void beforeNoToolResponse().then(() => {
+            if (!res.destroyed) sse(res, [start, ...text('first answer ends without tools'), ...end('end_turn')]);
+          });
+          return;
+        }
         if (lastText.includes('SLOW')) {
           // 중단 테스트용: 천천히 스트리밍
           res.writeHead(200, { 'content-type': 'text/event-stream' });
